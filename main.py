@@ -67,11 +67,15 @@ def cmd_scan(args):
     """Scan les signaux ICT en temps réel."""
     print_banner()
 
+    # Timeframes sélectionnés
+    active_tfs = [tf.strip() for tf in args.tfs.split(",") if tf.strip()] if args.tfs else None
+    tf_label = ", ".join(active_tfs) if active_tfs else "tous"
+
     analyzer = ICTAnalyzer()
-    print(f"📡 Scan de {args.symbol} sur tous les timeframes...")
+    print(f"📡 Scan de {args.symbol} sur {tf_label}...")
     print(f"⏰ {datetime.now().strftime('%H:%M:%S')}\n")
 
-    analysis = analyzer.analyze_symbol(args.symbol)
+    analysis = analyzer.analyze_symbol(args.symbol, timeframes=active_tfs)
 
     if "error" in analysis:
         print(f"❌ {analysis['error']}")
@@ -83,10 +87,11 @@ def cmd_scan(args):
     print(f"📊 Spread: {price.get('spread', 0):.1f} pips")
     print()
 
-    # Matrice des biases
+    # Matrice des biases (TFs actifs uniquement)
+    display_tfs = analysis.get("active_timeframes", TIMEFRAME_HIERARCHY)
     print("📊 MATRICE DES BIAS")
     print("-" * 50)
-    for tf_name in TIMEFRAME_HIERARCHY:
+    for tf_name in display_tfs:
         bias = analysis["bias_matrix"].get(tf_name, "neutral")
         icons = {"bullish": "🟢 HAUSSIER", "bearish": "🔴 BAISSIER", "neutral": "🟡 NEUTRE"}
         label = TIMEFRAME_LABELS.get(tf_name, tf_name)
@@ -317,6 +322,8 @@ def main():
     )
     parser.add_argument("--symbol", "-s", default="XAUUSD", help="Symbole a analyser")
     parser.add_argument("--lot", "-l", type=float, default=0.01, help="Taille de lot")
+    parser.add_argument("--tfs", "-t", default="",
+                        help="Timeframes a analyser (separes par des virgules, ex: D1,H4,H1,M15). Par defaut: tous")
 
     args = parser.parse_args()
 

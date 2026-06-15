@@ -10,7 +10,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from .config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS
+from .config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS, TIMEFRAME_NAMES
 from .data_engine import DataEngine
 from .ict_concepts import MultiTimeframeAnalyzer, DiscountPremium
 from .sessions import SessionDetector
@@ -35,13 +35,18 @@ class ICTAnalyzer:
         self.account = AccountMonitor()
         self.signal_gen = SignalGenerator()
 
-    def analyze_symbol(self, symbol: str = "XAUUSD", force_refresh: bool = False) -> Dict:
+    def analyze_symbol(
+        self, symbol: str = "XAUUSD", force_refresh: bool = False,
+        timeframes: Optional[List[str]] = None,
+    ) -> Dict:
         """
-        Analyse complète d'un symbole sur tous les timeframes.
-        Retourne un dictionnaire structuré avec tous les résultats.
+        Analyse complète d'un symbole sur les timeframes demandés.
+        Si timeframes est None, tous les timeframes sont analysés.
         """
+        active_tfs = timeframes if timeframes is not None else list(TIMEFRAME_NAMES)
+
         # 1. Récupérer les données
-        data = self.data_engine.fetch_all_timeframes(symbol, force=force_refresh)
+        data = self.data_engine.fetch_all_timeframes(symbol, force=force_refresh, timeframes=active_tfs)
         if not data:
             return {"error": f"Impossible de récupérer les données pour {symbol}"}
 
@@ -59,7 +64,7 @@ class ICTAnalyzer:
 
         # 5. Données par timeframe
         tf_data = {}
-        for tf_name in TIMEFRAME_HIERARCHY:
+        for tf_name in active_tfs:
             if tf_name in data and data[tf_name] is not None:
                 df = data[tf_name]
                 tf_data[tf_name] = self._analyze_timeframe(df, tf_name, analysis.get(tf_name, {}))
@@ -100,7 +105,8 @@ class ICTAnalyzer:
             "sessions": session_stats,
             "proximity": proximity,
             "proximity_setups": proximity_setups,
-            "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current),
+            "active_timeframes": active_tfs,
+            "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current, active_tfs),
         }
 
     def _analyze_timeframe(self, df: pd.DataFrame, tf_name: str, analysis: dict) -> Dict:
@@ -160,9 +166,11 @@ class ICTAnalyzer:
         return "Range / Consolidation"
 
     def _generate_top_down_summary(
-        self, bias_map: Dict, tf_data: Dict, current: Dict
+        self, bias_map: Dict, tf_data: Dict, current: Dict,
+        active_tfs: Optional[List[str]] = None,
     ) -> str:
-        """Génère un résumé top-down formaté."""
+        """Génère un résumé top-down formaté pour les TFs actifs."""
+        tfs = active_tfs if active_tfs else TIMEFRAME_HIERARCHY
         lines = [
             "=" * 60,
             "📊 ANALYSE ICT MULTI-TIMEFRAMES TOP-DOWN",
@@ -170,7 +178,7 @@ class ICTAnalyzer:
             "",
         ]
 
-        for tf_name in TIMEFRAME_HIERARCHY:
+        for tf_name in tfs:
             if tf_name not in tf_data:
                 continue
 

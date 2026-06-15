@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 
 import sys
 sys.path.insert(0, '.')
-from src.config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS, TIMEFRAME_BARS
+from src.config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS, TIMEFRAME_BARS, TIMEFRAME_NAMES
 from src.mt5_connector import MT5Connector
 from src.data_engine import DataEngine
 from src.ict_concepts import ICTConceptsDetector
@@ -124,6 +124,8 @@ def init_state():
         st.session_state.autorefresh = True
     if "last_refresh" not in st.session_state:
         st.session_state.last_refresh = time.time()
+    if "active_tfs" not in st.session_state:
+        st.session_state.active_tfs = list(TIMEFRAME_NAMES)
 
 
 CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥", "CHF": "CHF", "CAD": "C$", "AUD": "A$"}
@@ -271,6 +273,25 @@ def render_dashboard():
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     init_state()
 
+    # ─── Computations avant sidebar (nécessaires pour les badges) ────
+    all_sessions = st.session_state.session_detector.get_all_sessions()
+    countdown_str = ""
+    for s in all_sessions:
+        if s.active and s.time_until_close:
+            if s.name == "silver_bullet":
+                countdown_str = f"🔥 {s.label} — ferme dans {s.time_until_close}"
+            else:
+                countdown_str = f"⏳ {s.label} — ferme dans {s.time_until_close}"
+            break
+    if not countdown_str:
+        for s in all_sessions:
+            if not s.active and s.time_until_open:
+                if s.name != "silver_bullet":
+                    countdown_str = f"⏰ {s.label} ouvre dans {s.time_until_open}"
+                else:
+                    countdown_str = f"🔥 Silver Bullet dans {s.time_until_open}"
+                break
+
     # ─── Sidebar ───────────────────────────────────────────────────────
     with st.sidebar:
         st.title("📊 ICT Trading System")
@@ -297,14 +318,47 @@ def render_dashboard():
                 st.rerun()
 
         st.divider()
+        st.subheader("⏱️ Timeframes actifs")
+
+        # Checkboxes pour chaque TF
+        selected_tfs = []
+        for tf_name in TIMEFRAME_NAMES:
+            label = TIMEFRAME_LABELS.get(tf_name, tf_name)
+            checked = st.checkbox(
+                f"{label} ({tf_name})",
+                value=tf_name in st.session_state.active_tfs,
+                key=f"tf_{tf_name}",
+            )
+            if checked:
+                selected_tfs.append(tf_name)
+
+        if not selected_tfs:
+            # Empêcher de tout déco — garder au moins le dernier
+            selected_tfs = st.session_state.active_tfs
+
+        if selected_tfs != st.session_state.active_tfs:
+            st.session_state.active_tfs = selected_tfs
+            st.session_state.data_engine.clear_cache()
+            st.rerun()
+
+        st.caption(f"{len(selected_tfs)}/{len(TIMEFRAME_NAMES)} actifs")
+
+        st.divider()
         st.subheader("🕐 Sessions")
-        sessions = st.session_state.session_detector.get_all_sessions()
-        for s in sessions:
+        # Réutilise all_sessions calculé avant le sidebar
+        for s in all_sessions:
             cls = "active" if s.active else "inactive"
+            badge_text = s.label
+            if s.active and s.time_until_close:
+                badge_text += f" ({s.time_until_close})"
+            elif not s.active and s.time_until_open:
+                badge_text += f" +{s.time_until_open}"
             st.markdown(
-                f'<span class="session-badge {cls}">{s.label}</span>',
+                f'<span class="session-badge {cls}">{badge_text}</span>',
                 unsafe_allow_html=True,
             )
+        if countdown_str:
+            st.caption(countdown_str)
 
         st.divider()
         st.caption("v1.0 — Système ICT Multi-TF")
@@ -312,19 +366,43 @@ def render_dashboard():
 
     # ─── Refresh data ─────────────────────────────────────────────────
     now = time.time()
+    active_tfs = st.session_state.active_tfs
     if st.session_state.autorefresh or now - st.session_state.last_refresh > 30:
         st.session_state.analyzer = ICTAnalyzer()
-        analysis = st.session_state.analyzer.analyze_symbol(symbol, force_refresh=True)
+        analysis = st.session_state.analyzer.analyze_symbol(symbol, force_refresh=True, timeframes=active_tfs)
         st.session_state.last_refresh = now
     else:
-        analysis = st.session_state.analyzer.analyze_symbol(symbol)
+        analysis = st.session_state.analyzer.analyze_symbol(symbol, timeframes=active_tfs)
 
     if "error" in analysis:
         st.error(analysis["error"])
         return
 
-    # ─── Row 1: Prix et Compte ────────────────────────────────────────
+    # ─── Row 0: Contexte Macro ICT ───────────────────────────────────
     st.markdown(f'## {symbol} — Prix Temps Réel')
+
+    # Contexte macro ICT
+    macro = st.session_state.session_detector.compute_macro_context(
+        analysis.get("bias_matrix", {}),
+        analysis.get("proximity", {}),
+        analysis.get("sessions", {}),
+    )
+    macro_color = {"bullish": "#00ff88", "bearish": "#ff4444", "neutral": "#ffaa00"}.get(macro["macro_bias"], "#888")
+
+    # Le décompte countdown_str est déjà calculé avant le sidebar
+    if countdown_str:
+        macro_label_full = f"{macro['macro_label']} — {countdown_str}"
+    else:
+        macro_label_full = macro["macro_label"]
+
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);'
+        f'border:1px solid {macro_color};border-radius:12px;padding:12px 20px;'
+        f'margin-bottom:12px;text-align:center;">'
+        f'<span style="font-size:1.1rem;color:{macro_color};font-weight:700;">{macro_label_full}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     cols = st.columns([1, 1, 1, 1, 1, 1])
     price = analysis.get("current_price", {})
@@ -523,8 +601,9 @@ def render_dashboard():
     st.subheader("🔍 Analyse Multi-Timeframes")
 
     bias_map = analysis.get("bias_matrix", {})
-    cols = st.columns(len(TIMEFRAME_HIERARCHY))
-    for i, tf_name in enumerate(TIMEFRAME_HIERARCHY):
+    display_tfs = analysis.get("active_timeframes", TIMEFRAME_HIERARCHY)
+    cols = st.columns(len(display_tfs))
+    for i, tf_name in enumerate(display_tfs):
         if i < len(cols):
             with cols[i]:
                 bias = bias_map.get(tf_name, "neutral")
@@ -545,7 +624,7 @@ def render_dashboard():
         st.warning("⚠️ **Conflit de Timeframes** : " + " | ".join(analysis["conflicts"]))
         st.caption("Les TF longs sont en conflit avec les TF courts — signe de prudence")
 
-    # ─── Row 6: Proximité ICT ──────────────────────────────────────────────
+    # ─── Row 6: Proximité ICT (DataFrame) ──────────────────────────────────
     st.divider()
     st.subheader("📍 Proximité ICT")
     proximity = analysis.get("proximity", {})
@@ -555,73 +634,89 @@ def render_dashboard():
             "OTE": "🎯", "OB": "🧱", "FVG": "🕳️", "GAP": "〰️", "Discount": "🟢",
             "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
         }
-        col_prox = st.columns(3)
-        col_idx = 0
+        dir_labels = {"bullish": "🟢 HAUSSIER", "bearish": "🔴 BAISSIER", "neutral": "🟡 NEUTRE"}
+
+        rows = []
         for ctype in order:
             if ctype not in proximity:
                 continue
-            with col_prox[col_idx % 3]:
+            for a in proximity[ctype][:2]:
                 icon = icons.get(ctype, "📍")
-                st.markdown(f"**{icon} {ctype}**")
-                for a in proximity[ctype][:2]:
-                    entry_tag = " 🎯" if a.is_entry_zone else ""
-                    color = "#00ff88" if a.direction == "bullish" else ("#ff4444" if a.direction == "bearish" else "#ffaa00")
-                    st.markdown(
-                        f'<div class="metric-card" style="padding:10px;margin:4px 0;border-left:3px solid {color};">'
-                        f'<div style="font-size:0.75rem;color:#888;">{a.tf}</div>'
-                        f'<div style="font-size:0.85rem;color:#ccc;">{a.detail[:60]}</div>'
-                        f'<div style="font-size:0.9rem;color:{color};font-weight:600;">'
-                        f'{a.distance_label()}{entry_tag}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                col_idx += 1
+                rows.append({
+                    "Concept": f"{icon} {ctype}",
+                    "TF": a.tf,
+                    "Direction": dir_labels.get(a.direction, a.direction.upper()),
+                    "Zone": f"{a.level_low:.1f} – {a.level_high:.1f}",
+                    "Distance": a.distance_label(),
+                    "Force": f"{a.strength:.0%}",
+                })
+
+        if rows:
+            df_prox = pd.DataFrame(rows)
+            st.dataframe(
+                df_prox,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Concept": st.column_config.TextColumn("🏷️ Concept", width="small"),
+                    "TF": st.column_config.TextColumn("📡 TF", width="small"),
+                    "Direction": st.column_config.TextColumn("Direction", width="medium"),
+                    "Zone": st.column_config.TextColumn("🎯 Zone", width="medium"),
+                    "Distance": st.column_config.TextColumn("📏 Distance", width="medium"),
+                    "Force": st.column_config.TextColumn("💪 Force", width="small"),
+                },
+            )
     else:
         st.info("Aucune proximité ICT détectée.")
 
-    # ─── Row 7: Setups de Trading ──────────────────────────────────────────
+    # ─── Row 7: Setups de Trading (DataFrame) ──────────────────────────────
     st.divider()
     st.subheader("🎯 Setups de Trading (Proximité ICT)")
     setups = analysis.get("proximity_setups", [])
     if setups:
-        col_setups = st.columns(2)
-        for i, s in enumerate(setups[:2]):
-            with col_setups[i % 2]:
-                direction_icon = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
-                direction_color = "#00ff88" if s.direction == "long" else "#ff4444"
-                bg = "rgba(0,255,136,0.05)" if s.direction == "long" else "rgba(255,68,68,0.05)"
-                border = "1px solid rgba(0,255,136,0.2)" if s.direction == "long" else "1px solid rgba(255,68,68,0.2)"
-                rr = s.risk_reward()
-                tp2_str = f"<div><span style='color:#888;'>TP2</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_2:.1f}</span></div>" if s.target_2 else ""
-                tp3_str = f"<div><span style='color:#888;'>TP3</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_3:.1f}</span></div>" if s.target_3 else ""
+        rows = []
+        for s in setups:
+            direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
+            rr = s.risk_reward()
+            tfs_str = ', '.join(s.tfs) if s.tfs else ''
+            tp2_str = f"{s.target_2:.1f}" if s.target_2 else "-"
+            tp3_str = f"{s.target_3:.1f}" if s.target_3 else "-"
+            rows.append({
+                "Direction": direction,
+                "Force": f"{s.strength:.0%}",
+                "R:R": f"{rr}",
+                "TFs": tfs_str,
+                "Entrée": f"{s.entry_low:.1f} – {s.entry_high:.1f}",
+                "SL": f"{s.stop_loss:.1f}",
+                "TP1": f"{s.target_1:.1f}",
+                "TP2": tp2_str,
+                "TP3": tp3_str,
+                "Raison Entrée": s.entry_reason,
+                "Raison SL": s.sl_reason,
+                "Raison TP": s.tp_reason,
+            })
 
-                tfs_str = ', '.join(s.tfs) if s.tfs else ''
-                st.markdown(
-                    f'<div style="background:{bg};border:{border};border-radius:12px;'
-                    f'padding:16px;margin:8px 0;">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                    f'<h3 style="color:{direction_color};margin:0;">{direction_icon}</h3>'
-                    f'<span style="color:#ffaa00;font-weight:600;">Force: {s.strength:.0%} | R:R: {rr}</span>'
-                    f'</div>'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px;">'
-                    f'<span style="color:#666;font-size:0.75rem;">📡 TF: {tfs_str}</span>'
-                    f'</div>'
-                    f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px;">'
-                    f'<div><span style="color:#888;">Entrée</span><br><span style="color:#fff;font-weight:600;">{s.entry_low:.1f}-{s.entry_high:.1f}</span></div>'
-                    f'<div><span style="color:#888;">SL</span><br><span style="color:#ff4444;font-weight:600;">{s.stop_loss:.1f}</span></div>'
-                    f'<div><span style="color:#888;">TP1</span><br><span style="color:{direction_color};font-weight:600;">{s.target_1:.1f}</span></div>'
-                    f'{tp2_str}'
-                    f'{tp3_str}'
-                    f'</div>'
-                    f'<div style="margin-top:10px;font-size:0.8rem;">'
-                    f'<div><span style="color:#888;">🎯 Entrée :</span> <span style="color:#ccc;">{s.entry_reason}</span></div>'
-                    f'<div><span style="color:#888;">🛑 SL :</span> <span style="color:#ccc;">{s.sl_reason}</span></div>'
-                    f'<div><span style="color:#888;">🎯 TP :</span> <span style="color:#ccc;">{s.tp_reason}</span></div>'
-                    f'</div>'
-                    f'<p style="margin:6px 0 0 0;color:#888;font-size:0.75rem;">{s.reason}</p>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+        if rows:
+            df_setups = pd.DataFrame(rows)
+            st.dataframe(
+                df_setups,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Direction": st.column_config.TextColumn("🎯 Direction", width="small"),
+                    "Force": st.column_config.TextColumn("💪 Force", width="small"),
+                    "R:R": st.column_config.TextColumn("📊 R:R", width="small"),
+                    "TFs": st.column_config.TextColumn("📡 TFs", width="small"),
+                    "Entrée": st.column_config.TextColumn("💰 Entrée", width="medium"),
+                    "SL": st.column_config.TextColumn("🛑 SL", width="medium"),
+                    "TP1": st.column_config.TextColumn("TP1", width="small"),
+                    "TP2": st.column_config.TextColumn("TP2", width="small"),
+                    "TP3": st.column_config.TextColumn("TP3", width="small"),
+                    "Raison Entrée": st.column_config.TextColumn("🎯 Raison Entrée", width="large"),
+                    "Raison SL": st.column_config.TextColumn("🛑 Raison SL", width="large"),
+                    "Raison TP": st.column_config.TextColumn("🎯 Raison TP", width="large"),
+                },
+            )
     else:
         st.info("Aucun setup de trading basé sur la proximité ICT.")
 

@@ -100,11 +100,18 @@ class DataEngine:
         return df
 
     def fetch_all_timeframes(
-        self, symbol: str, force: bool = False
+        self, symbol: str, force: bool = False,
+        timeframes: Optional[List[str]] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """Récupère tous les timeframes pour un symbole."""
+        """
+        Récupère les données pour un symbole sur les timeframes demandés.
+        Si timeframes est None, tous les timeframes sont chargés.
+        """
         result = {}
-        for tf_name in TIMEFRAME_NAMES:
+        tfs = timeframes if timeframes is not None else TIMEFRAME_NAMES
+        for tf_name in tfs:
+            if tf_name not in TIMEFRAMES:
+                continue
             df = self.fetch_rates(symbol, tf_name, force=force)
             if df is not None:
                 result[tf_name] = df
