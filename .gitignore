@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/
+
+# MT5 Reports
+mt5-reports/
+
+# Rapports d'analyse générés
+analyse_ICT_*.md
+
+# Temp
+nul
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
