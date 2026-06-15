@@ -23,7 +23,8 @@ Connecté à **MetaTrader 5** (compte FTMO) pour l'analyse multi-timeframes, la 
 
 ```
 trading/
-├── main.py                          # Point d'entrée CLI
+├── main.py                          # Point d'entrée CLI (dashboard, scan, analyze...)
+├── start_dashboard.bat              # Lanceur Windows avec cleanup auto
 ├── requirements.txt                 # Dépendances Python
 ├── README.md                        # Documentation
 ├── src/
@@ -31,8 +32,9 @@ trading/
 │   ├── config.py                    # Configuration centralisée
 │   ├── mt5_connector.py             # Connexion singleton MT5
 │   ├── data_engine.py               # Données OHLC multi-TF avec cache
-│   ├── ict_concepts.py              # Détection OB, FVG, MSS, Liquidité
+│   ├── ict_concepts.py              # Détection OB, FVG, MSS, Liquidité, PriceGap
 │   ├── sessions.py                  # Kill Zones (Asie/Londres/NY)
+│   ├── proximity.py                 # Proximité prix + setups trading LONG/SHORT
 │   ├── signal_generator.py          # Scoring et génération de signaux
 │   ├── trade_manager.py             # Exécution d'ordres MT5
 │   ├── risk_manager.py              # Position sizing et limites
@@ -136,14 +138,43 @@ python main.py positions
 python main.py account
 ```
 
-### Dashboard Streamlit
+### Dashboard Streamlit (recommandé)
+
 ```bash
+# Via main.py — NETTOIE les caches + tue les anciens processus automatiquement
 python main.py
-# Ou directement:
+# ou explicitement :
+python main.py dashboard
+```
+
+### Dashboard Streamlit (direct, sans cleanup)
+```bash
+# Lancement direct — PAS de nettoyage automatique
 streamlit run src/dashboard.py
 ```
 
+> ⚠️ **Important :** `streamlit run` ne nettoie pas les caches `.pyc`. Après une mise à jour du code, utilisez `python main.py dashboard` ou `start_dashboard.bat` pour éviter les erreurs `AttributeError` liées à un cache obsolète.
+
+### Lanceur Windows (`start_dashboard.bat`)
+```bat
+# Double-clic sur start_dashboard.bat dans l'Explorateur
+# Effectue le cleanup (PID + cache) puis lance le dashboard
+```
+
 Accès : [http://localhost:8501](http://localhost:8501)
+
+---
+
+## 🧹 Cleanup automatique (PID + cache)
+
+À chaque lancement via `python main.py dashboard` ou `start_dashboard.bat`, le système :
+
+1. **Tue les anciens processus Streamlit** sur le port `8501` via `netstat` + `taskkill`
+2. **Supprime tous les `__pycache__`** du projet (`.git` et `.venv` exclus)
+3. **Supprime les fichiers `.pyc` orphelins**
+4. Lance Streamlit avec l'option `-B` (désactive la génération de bytecode)
+
+Ce mécanisme prévient les `AttributeError` causées par un cache obsolète après une modification du code source.
 
 ---
 

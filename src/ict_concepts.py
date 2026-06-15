@@ -63,6 +63,28 @@ class LiquidityLevel:
     swept: bool = False
 
 @dataclass
+class PriceGap:
+    """
+    Gap d'ouverture : écart entre le close de la bougie précédente
+    et l'open de la bougie actuelle. Types :
+    - common : gap normal (< 1× ATR)
+    - breakaway : gap de rupture (1-2× ATR)
+    - runaway : gap de continuation (2-3× ATR)
+    - exhaustion : gap d'épuisement (> 3× ATR)
+    """
+    tf: str
+    direction: str  # "up" | "down"
+    gap_size: float  # Taille absolue du gap
+    open_price: float
+    prev_close: float
+    gap_percent: float  # % du prix
+    index: int
+    time: Any
+    gap_type: str = "common"  # common | breakaway | runaway | exhaustion
+    filled: bool = False  # True si le gap a été refermé
+
+
+@dataclass
 class DiscountPremium:
     """Niveaux de Discount (zone achat) et Premium (zone vente)."""
     tf: str
@@ -327,6 +349,88 @@ class ICTConceptsDetector:
 
         return levels
 
+    # ── Price Gaps (gaps d'ouverture) ─────────────────────────────────────
+
+    def detect_price_gaps(self, df: pd.DataFrame) -> List[PriceGap]:
+        """
+        Détecte les gaps d'ouverture : écart entre close[i-1] et open[i].
+        Types selon le contexte de marché :
+        - common : gap normal (< 1× ATR)
+        - breakaway : gap de rupture en sortie de range
+        - runaway : gap de continuation en trend
+        - exhaustion : gap d'épuisement
+        """
+        gaps: List[PriceGap] = []
+        if df is None or len(df) < 10:
+            return gaps
+
+        closes = df["close"].values
+        opens = df["open"].values
+        highs = df["high"].values
+        lows = df["low"].values
+
+        # Calcul ATR approximatif (sur 14 périodes)
+        atr_values = []
+        for i in range(1, len(df)):
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+            atr_values.append(tr)
+        atr = float(np.mean(atr_values[-14:])) if len(atr_values) >= 14 else float(np.mean(atr_values)) if atr_values else 0
+        atr = max(atr, 0.01)  # Éviter division par zéro
+
+        # Seuil minimum : 0.3× ATR (ignorer les micro-gaps insignifiants)
+        min_gap = atr * 0.3
+
+        for i in range(2, len(df)):
+            prev_close = closes[i-1]
+            curr_open = opens[i]
+            gap = curr_open - prev_close
+            abs_gap = abs(gap)
+
+            if abs_gap < min_gap:
+                continue
+
+            direction = "up" if gap > 0 else "down"
+
+            # Déterminer si le gap a été refermé
+            filled = False
+            if direction == "up":
+                # Gap haussier refermé si le prix est redescendu sous le close précédent
+                if lows[i] <= prev_close and closes[i] < prev_close:
+                    filled = True
+            else:
+                # Gap baissier refermé si le prix est remonté au-dessus du close précédent
+                if highs[i] >= prev_close and closes[i] > prev_close:
+                    filled = True
+
+            # Catégoriser le type de gap
+            gap_ratio = abs_gap / atr
+            if gap_ratio < 1.0:
+                gap_type = "common"
+            elif gap_ratio < 2.0:
+                gap_type = "breakaway"
+            elif gap_ratio < 3.0:
+                gap_type = "runaway"
+            else:
+                gap_type = "exhaustion"
+
+            # Force basée sur la taille du gap
+            strength = min(gap_ratio / 4.0, 1.0)
+
+            gaps.append(PriceGap(
+                tf=self.tf,
+                direction=direction,
+                gap_size=round(abs_gap, 2),
+                open_price=curr_open,
+                prev_close=prev_close,
+                gap_percent=round(abs_gap / prev_close * 100, 3),
+                index=i,
+                time=df.index[i],
+                gap_type=gap_type,
+                filled=filled,
+            ))
+
+        return gaps
+
     # ── Discount / Premium ──────────────────────────────────────────────────
 
     def detect_discount_premium(self, df: pd.DataFrame) -> Optional[DiscountPremium]:
@@ -362,6 +466,7 @@ class ICTConceptsDetector:
         return {
             "order_blocks": self.detect_order_blocks(df),
             "fvgs": self.detect_fvg(df),
+            "price_gaps": self.detect_price_gaps(df),
             "mss": self.detect_mss(df),
             "liquidity": self.detect_liquidity(df),
             "discount_premium": self.detect_discount_premium(df),

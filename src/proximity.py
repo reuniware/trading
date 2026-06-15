@@ -14,7 +14,7 @@ from datetime import datetime
 from .config import TIMEFRAME_LABELS
 from .ict_concepts import (
     OrderBlock, FairValueGap, MarketStructureShift,
-    LiquidityLevel, DiscountPremium,
+    LiquidityLevel, DiscountPremium, PriceGap,
 )
 
 logger = logging.getLogger("Proximity")
@@ -141,6 +141,12 @@ class PriceProximityAnalyzer:
             if dp:
                 alerts.extend(self._check_dp_zones(current_price, dp, tf_name, max_dist))
 
+            # --- Price Gaps ---
+            for gap in result.get("price_gaps", []):
+                alert = self._check_price_gap(current_price, gap, tf_name, max_dist)
+                if alert:
+                    alerts.append(alert)
+
             # --- OTE (Optimal Trade Entry) ---
             ote = self._compute_ote(result, tf_name, tf_label)
             if ote:
@@ -165,6 +171,7 @@ class PriceProximityAnalyzer:
         grouped = {
             "OB": [],
             "FVG": [],
+            "GAP": [],
             "OTE": [],
             "Discount": [],
             "Premium": [],
@@ -390,6 +397,39 @@ class PriceProximityAnalyzer:
             is_entry_zone=False,
         )
 
+    def _check_price_gap(
+        self, price: float, gap: PriceGap, tf: str, max_dist: float
+    ) -> Optional[ProximityAlert]:
+        """Vérifie la proximité d'un gap d'ouverture."""
+        level_low = min(gap.prev_close, gap.open_price)
+        level_high = max(gap.prev_close, gap.open_price)
+        gap_mid = (level_low + level_high) / 2
+        
+        dist = price - gap_mid
+        abs_dist = abs(dist)
+
+        if abs_dist > max_dist * 2:
+            return None
+
+        inside = level_low <= price <= level_high
+        direction = "bullish" if gap.direction == "up" else "bearish"
+        gap_type_label = {"common": "Commun", "breakaway": "Rupture", "runaway": "Continuation", "exhaustion": "Épuisement"}.get(gap.gap_type, gap.gap_type)
+        filled_str = " — refermé" if gap.filled else ""
+
+        return ProximityAlert(
+            concept_type="GAP",
+            tf=tf,
+            direction=direction,
+            level_low=round(level_low, 1),
+            level_high=round(level_high, 1),
+            price_distance=0.0 if inside else dist,
+            distance_pct=self._dist_pct(abs_dist),
+            strength=0.7,
+            detail=f"Gap {'HAUSSIER' if gap.direction == 'up' else 'BAISSIER'} {tf} ({gap_type_label} — {gap.gap_size:.1f}$)"
+                   f" {gap.prev_close:.1f}→{gap.open_price:.1f}{filled_str}",
+            is_entry_zone=inside,
+        )
+
     def _check_mss(
         self, price: float, mss: MarketStructureShift, tf: str, max_dist: float
     ) -> Optional[ProximityAlert]:
@@ -582,18 +622,23 @@ class PriceProximityAnalyzer:
         entry_low = price - self.pd_range * 0.05
         entry_high = price + self.pd_range * 0.05
 
-        # Raison entrée
+        # Raison entrée avec TFs
         entry_parts = []
         if has_ote:
-            entry_parts.append("zone OTE")
+            tfs = sorted(set(a.tf for a in alerts.get("OTE", []) if a.is_entry_zone))
+            entry_parts.append(f"zone OTE ({', '.join(tfs)})")
         if has_discount:
-            entry_parts.append("zone Discount")
+            tfs = sorted(set(a.tf for a in alerts.get("Discount", []) if a.is_entry_zone))
+            entry_parts.append(f"zone Discount ({', '.join(tfs)})")
         if has_bullish_ob:
-            entry_parts.append("OB haussier")
+            tfs = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bullish"))
+            entry_parts.append(f"OB haussier ({', '.join(tfs)})")
         if has_bullish_fvg:
-            entry_parts.append("FVG haussier")
+            tfs = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bullish"))
+            entry_parts.append(f"FVG haussier ({', '.join(tfs)})")
         if has_ssl_near:
-            entry_parts.append("proximité SSL")
+            tfs = sorted(set(a.tf for a in alerts.get("SSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
+            entry_parts.append(f"proximité SSL ({', '.join(tfs)})")
         htf_str = "favorable" if bias_long > bias_short else "neutre"
         entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
 
@@ -726,16 +771,20 @@ class PriceProximityAnalyzer:
         entry_low = price - self.pd_range * 0.05
         entry_high = price + self.pd_range * 0.05
 
-        # Raison entrée
+        # Raison entrée avec TFs
         entry_parts = []
         if has_premium:
-            entry_parts.append("zone Premium")
+            tfs = sorted(set(a.tf for a in alerts.get("Premium", []) if a.is_entry_zone))
+            entry_parts.append(f"zone Premium ({', '.join(tfs)})")
         if has_bearish_ob:
-            entry_parts.append("OB baissier")
+            tfs = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bearish"))
+            entry_parts.append(f"OB baissier ({', '.join(tfs)})")
         if has_bearish_fvg:
-            entry_parts.append("FVG baissier")
+            tfs = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bearish"))
+            entry_parts.append(f"FVG baissier ({', '.join(tfs)})")
         if has_bsl_near:
-            entry_parts.append("proximité BSL")
+            tfs = sorted(set(a.tf for a in alerts.get("BSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
+            entry_parts.append(f"proximité BSL ({', '.join(tfs)})")
         htf_str = "favorable" if bias_short > bias_long else "neutre"
         entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
 
@@ -771,9 +820,9 @@ class PriceProximityAnalyzer:
 
         lines = ["📍 PROXIMITÉS ICT", "=" * 55]
 
-        order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
         icons = {
-            "OB": "🧱", "FVG": "🕳️", "OTE": "🎯", "Discount": "🟢",
+            "OB": "🧱", "FVG": "🕳️", "GAP": "〰️", "OTE": "🎯", "Discount": "🟢",
             "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
         }
 

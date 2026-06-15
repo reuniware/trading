@@ -300,7 +300,7 @@ class ICTAnalyzer:
             lines.append("")
             lines.append("| Concept | Timeframe | Zone | Distance | Force |")
             lines.append("|---------|-----------|------|----------|-------|")
-            order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+            order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
             for ctype in order:
                 if ctype not in proximity:
                     continue
@@ -348,6 +348,8 @@ class ICTAnalyzer:
             for s in setups:
                 direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
                 lines.append(f"**{direction}** : {s.reason}")
+                tfs_str = ', '.join(s.tfs) if s.tfs else 'N/A'
+                lines.append(f"- 📡 **Timeframes:** {tfs_str}")
                 lines.append(f"- 🎯 **Entrée :** {s.entry_reason}")
                 lines.append(f"- 🛑 **SL :** {s.sl_reason}")
                 lines.append(f"- 🎯 **TP :** {s.tp_reason}")

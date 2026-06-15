@@ -134,9 +134,9 @@ def cmd_scan(args):
     print("-" * 55)
     proximity = analysis.get("proximity", {})
     if proximity:
-        order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
         icons = {
-            "OB": "🧱", "FVG": "🕳️", "OTE": "🎯", "Discount": "🟢",
+            "OB": "🧱", "FVG": "🕳️", "GAP": "〰️", "OTE": "🎯", "Discount": "🟢",
             "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
         }
         for ctype in order:
@@ -165,7 +165,8 @@ def cmd_scan(args):
             tp2_str = f" | TP2: {s.target_2:.1f}" if s.target_2 else ""
             tp3_str = f" | TP3: {s.target_3:.1f}" if s.target_3 else ""
 
-            print(f"\n  {direction} | Force: {strength_pct} | R:R: {rr}")
+            tfs_str = f" | TFs: {', '.join(s.tfs)}" if s.tfs else ""
+            print(f"\n  {direction} | Force: {strength_pct} | R:R: {rr}{tfs_str}")
             print(f"    ├─ Entrée: {s.entry_low:.1f} - {s.entry_high:.1f}")
             print(f"    │  {s.entry_reason}")
             print(f"    ├─ SL:     {s.stop_loss:.1f}")

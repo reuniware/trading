@@ -550,9 +550,9 @@ def render_dashboard():
     st.subheader("📍 Proximité ICT")
     proximity = analysis.get("proximity", {})
     if proximity:
-        order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
         icons = {
-            "OTE": "🎯", "OB": "🧱", "FVG": "🕳️", "Discount": "🟢",
+            "OTE": "🎯", "OB": "🧱", "FVG": "🕳️", "GAP": "〰️", "Discount": "🟢",
             "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
         }
         col_prox = st.columns(3)
@@ -595,12 +595,16 @@ def render_dashboard():
                 tp2_str = f"<div><span style='color:#888;'>TP2</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_2:.1f}</span></div>" if s.target_2 else ""
                 tp3_str = f"<div><span style='color:#888;'>TP3</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_3:.1f}</span></div>" if s.target_3 else ""
 
+                tfs_str = ', '.join(s.tfs) if s.tfs else ''
                 st.markdown(
                     f'<div style="background:{bg};border:{border};border-radius:12px;'
                     f'padding:16px;margin:8px 0;">'
                     f'<div style="display:flex;justify-content:space-between;align-items:center;">'
                     f'<h3 style="color:{direction_color};margin:0;">{direction_icon}</h3>'
                     f'<span style="color:#ffaa00;font-weight:600;">Force: {s.strength:.0%} | R:R: {rr}</span>'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px;">'
+                    f'<span style="color:#666;font-size:0.75rem;">📡 TF: {tfs_str}</span>'
                     f'</div>'
                     f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px;">'
                     f'<div><span style="color:#888;">Entrée</span><br><span style="color:#fff;font-weight:600;">{s.entry_low:.1f}-{s.entry_high:.1f}</span></div>'
