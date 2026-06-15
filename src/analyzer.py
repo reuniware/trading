@@ -16,7 +16,7 @@ from .ict_concepts import MultiTimeframeAnalyzer, DiscountPremium
 from .sessions import SessionDetector
 from .account_monitor import AccountMonitor
 from .signal_generator import SignalGenerator
-from .proximity import PriceProximityAnalyzer
+from .proximity import PriceProximityAnalyzer, ProximitySetup
 
 logger = logging.getLogger("Analyzer")
 
@@ -74,9 +74,16 @@ class ICTAnalyzer:
 
         # 7. Proximité ICT (prix vs concepts)
         price_val = current.get("bid", 0) or current.get("ask", 0)
-        pd_range = self._get_pd_array_range(data)
+        # PD Array range inline (evite methode separee qui pose probleme de cache Streamlit)
+        pd_range = 50.0
+        for tf in ["M15", "M5", "H1"]:
+            if tf in data and data[tf] is not None and len(data[tf]) >= 10:
+                df = data[tf].tail(10)
+                pd_range = float(df["high"].max() - df["low"].min())
+                break
         prox_analyzer = PriceProximityAnalyzer(pd_array_range=pd_range)
         proximity = prox_analyzer.analyze(price_val, analysis)
+        proximity_setups = prox_analyzer.compute_setups(proximity, analysis, price_val)
 
         # 8. Compte
         account_stats = self.account.get_account_stats()
@@ -92,6 +99,7 @@ class ICTAnalyzer:
             "signals": signals,
             "sessions": session_stats,
             "proximity": proximity,
+            "proximity_setups": proximity_setups,
             "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current),
         }
 
@@ -133,14 +141,6 @@ class ICTAnalyzer:
             "liquidity": analysis.get("liquidity", []),
             "discount_premium": analysis.get("discount_premium"),
         }
-
-    def _get_pd_array_range(self, data: Dict) -> float:
-        """Calcule le PD Array range (10 dernieres bougies M15)."""
-        for tf in ["M15", "M5", "H1"]:
-            if tf in data and data[tf] is not None and len(data[tf]) >= 10:
-                df = data[tf].tail(10)
-                return float(df["high"].max() - df["low"].min())
-        return 50.0
 
     def _get_market_structure(self, df: pd.DataFrame) -> str:
         """Détermine la structure de marché (HH/HL, LH/LL)."""
@@ -323,6 +323,34 @@ class ICTAnalyzer:
                     lines.append(f"- {a.detail}")
                     lines.append(f"  - Distance: {a.distance_label()}{entry_tag}")
                     lines.append(f"  - Zone: {a.level_low:.1f} – {a.level_high:.1f}")
+                lines.append("")
+
+        # Setups de trading
+        setups = analysis.get("proximity_setups", [])
+        if setups:
+            lines.append("## 🎯 SETUPS DE TRADING (Proximité ICT)")
+            lines.append("")
+            lines.append("| Direction | Force | R:R | Entrée | SL | TP1 | TP2 |")
+            lines.append("|-----------|-------|-----|--------|----|-----|-----|")
+            for s in setups:
+                direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
+                rr = s.risk_reward()
+                tp2_str = f"{s.target_2:.1f}" if s.target_2 else "-"
+                lines.append(
+                    f"| **{direction}** | {s.strength:.0%} | {rr} | "
+                    f"{s.entry_low:.1f}-{s.entry_high:.1f} | {s.stop_loss:.1f} | "
+                    f"{s.target_1:.1f} | {tp2_str} |"
+                )
+
+            lines.append("")
+            lines.append("### Détails")
+            lines.append("")
+            for s in setups:
+                direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
+                lines.append(f"**{direction}** : {s.reason}")
+                lines.append(f"- 🎯 **Entrée :** {s.entry_reason}")
+                lines.append(f"- 🛑 **SL :** {s.sl_reason}")
+                lines.append(f"- 🎯 **TP :** {s.tp_reason}")
                 lines.append("")
 
         # Partie 4: Sessions

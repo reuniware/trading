@@ -84,6 +84,8 @@ trading/
 - Courbe d'equity
 - Matrice des biases multi-TF
 - Sessions et Silver Bullet
+- **📍 Proximité ICT** : détection des concepts proches du prix sur tous les TFs
+- **🎯 Setups de trading** : suggestions LONG/SHORT avec SL, TP et raisons détaillées
 
 ---
 
@@ -199,12 +201,21 @@ Monitoring du compte :
 - Win rate, profit factor, courbe d'equity
 - Filtre des opérations non-trade (type BALANCE)
 
+### `src/proximity.py`
+Analyse de proximité du prix avec les concepts ICT :
+- Détection des OB, FVG, OTE, Discount/Premium, BSL/SSL, MSS proches du prix
+- Filtre adaptatif basé sur le PD Array range
+- Génération de **setups LONG/SHORT** avec SL et TP
+- R:R calculé automatiquement
+- **Raisons détaillées** : pourquoi l'entrée, pourquoi le SL à ce niveau, pourquoi le TP
+
 ### `src/analyzer.py`
 Analyseur complet :
 - Génération de rapports markdown structurés
 - Matrice des biases multi-TF
 - Détection de conflits directionnels
 - Résumé top-down ICT
+- Intégration des setups de trading dans les rapports
 
 ### `src/dashboard.py`
 Interface Streamlit temps réel :
@@ -212,6 +223,8 @@ Interface Streamlit temps réel :
 - Graphiques Plotly avec concepts ICT
 - Auto-refresh configurable
 - Cards métriques responsives
+- **📍 Proximité ICT** avec détails par concept
+- **🎯 Setups de trading** avec raisons entrée/SL/TP
 
 ---
 

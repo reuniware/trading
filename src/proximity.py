@@ -42,6 +42,48 @@ class ProximityAlert:
 
 
 @dataclass
+class ProximitySetup:
+    """
+    Setup de trading dérivé des proximités ICT.
+    Suggère une entrée Long/Short avec SL et TP quand
+    les conditions ICT sont réunies.
+    """
+    direction: str        # "long" | "short"
+    entry_low: float
+    entry_high: float
+    stop_loss: float
+    target_1: float
+    target_2: Optional[float] = None
+    target_3: Optional[float] = None
+    strength: float = 0.0
+    reason: str = ""
+    entry_reason: str = ""
+    sl_reason: str = ""
+    tp_reason: str = ""
+    concepts: List[str] = field(default_factory=list)
+    tfs: List[str] = field(default_factory=list)
+
+    def risk_reward(self) -> float:
+        """Ratio risque/récompense (TP1)."""
+        if self.stop_loss == 0.0:
+            return 0.0
+        entry = (self.entry_low + self.entry_high) / 2
+        if self.direction == "long":
+            risk = entry - self.stop_loss
+            reward = self.target_1 - entry
+        else:
+            risk = self.stop_loss - entry
+            reward = entry - self.target_1
+        if risk <= 0:
+            return 0.0
+        return round(reward / risk, 2)
+
+    @property
+    def entry_mid(self) -> float:
+        return (self.entry_low + self.entry_high) / 2
+
+
+@dataclass
 class OTEZone:
     """Optimal Trade Entry zone (50-61.8% retracement ICT)."""
     tf: str
@@ -370,6 +412,357 @@ class PriceProximityAnalyzer:
             detail=f"{mss.type} {mss.direction.upper()} {tf} à {mss.break_level:.1f}",
             is_entry_zone=False,
         )
+
+    # ─── Setups de trading ────────────────────────────────────────────────
+
+    def compute_setups(
+        self,
+        alerts: Dict[str, List[ProximityAlert]],
+        analysis: Dict[str, dict],
+        current_price: float,
+    ) -> List[ProximitySetup]:
+        """
+        Génère des setups Long/Short avec SL et TP à partir des proximités.
+        
+        Logique ICT :
+        - LONG : prix dans Discount ou OTE ou OB/FVG haussier → SL sous la zone, TP vers Premium
+        - SHORT : prix dans Premium ou OB/FVG baissier → SL au-dessus, TP vers Discount
+        """
+        if not alerts or not analysis or current_price <= 0:
+            return []
+
+        setups: List[ProximitySetup] = []
+
+        # Collecter le bias par TF pour confirmer la direction
+        bias_long_tfs = 0
+        bias_short_tfs = 0
+        for tf_name in ["MN1", "W1", "D1", "H4", "H1"]:
+            tf_result = analysis.get(tf_name, {})
+            obs = tf_result.get("order_blocks", [])
+            fvgs = tf_result.get("fvgs", [])
+            for ob in obs:
+                if ob.type == "bullish":
+                    bias_long_tfs += 1
+                elif ob.type == "bearish":
+                    bias_short_tfs += 1
+            for fvg in fvgs:
+                if fvg.type == "bullish":
+                    bias_long_tfs += 1
+                elif fvg.type == "bearish":
+                    bias_short_tfs += 1
+
+        # --- SETUP LONG ---
+        setup_long = self._build_long_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs)
+        if setup_long:
+            setups.append(setup_long)
+
+        # --- SETUP SHORT ---
+        setup_short = self._build_short_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs)
+        if setup_short:
+            setups.append(setup_short)
+
+        setups.sort(key=lambda s: s.strength, reverse=True)
+        return setups
+
+    def _build_long_setup(
+        self, alerts: Dict[str, List[ProximityAlert]],
+        analysis: Dict[str, dict],
+        price: float,
+        bias_long: int,
+        bias_short: int,
+    ) -> Optional[ProximitySetup]:
+        """Construit un setup LONG si les conditions sont réunies."""
+        # Conditions pour LONG :
+        # 1. Prix dans Discount zone OU OTE OU proche d'un OB haussier OU SSL
+        # 2. Un SL peut être placé en dessous
+        # 3. Un TP peut être placé au-dessus
+
+        has_discount = "Discount" in alerts and any(a.is_entry_zone for a in alerts["Discount"])
+        has_ote = "OTE" in alerts and any(a.is_entry_zone for a in alerts["OTE"])
+        has_bullish_ob = "OB" in alerts and any(
+            a.is_entry_zone and a.direction == "bullish" for a in alerts["OB"]
+        )
+        has_bullish_fvg = "FVG" in alerts and any(
+            a.is_entry_zone and a.direction == "bullish" for a in alerts["FVG"]
+        )
+        has_ssl_near = "SSL" in alerts and any(
+            not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5
+            for a in alerts["SSL"]
+        )
+
+        # Au moins une condition haussière remplie
+        if not (has_discount or has_ote or has_bullish_ob or has_bullish_fvg or has_ssl_near):
+            return None
+
+        # Collecter les niveaux pour le calcul SL/TP
+        # IMPORTANT: seuls les supports PROCHES du prix (dans 2*PD range) sont retenus
+        max_support_dist = self.pd_range * 2.0
+        support_levels = []  # Niveaux sous le prix (pour SL)
+        support_details = []  # Détails des supports retenus
+        concepts_used = []
+        tfs_used = set()
+        strength_sum = 0.0
+        count = 0
+
+        for ctype in ["OB", "FVG", "Discount", "OTE", "SSL"]:
+            if ctype not in alerts:
+                continue
+            for a in alerts[ctype]:
+                # Concepts haussiers ou en zone
+                if a.direction in ("bullish", "neutral") or a.is_entry_zone:
+                    near_dist = abs(a.price_distance) if not a.is_entry_zone else abs(price - a.level_low)
+                    if near_dist < max_support_dist or a.is_entry_zone:
+                        support_levels.append(a.level_low)
+                        if a.level_high > a.level_low:
+                            support_levels.append(a.level_high)
+                        support_details.append(f"{ctype} {a.tf} ({a.level_low:.1f}-{a.level_high:.1f})")
+                    concepts_used.append(ctype)
+                    tfs_used.add(a.tf)
+                    count += 1
+                    strength_sum += a.strength * (2.0 if a.is_entry_zone else 1.0)
+
+        # Chercher des résistances (bearish OB/FVG) dans l'analyse complète
+        res_high = 0.0
+        res_detail = ""
+        for tf_name, result in analysis.items():
+            for ob in result.get("order_blocks", []):
+                if ob.type == "bearish" and ob.low > price:
+                    if res_high == 0 or ob.low < res_high:
+                        res_high = ob.low
+                        res_detail = f"OB baissier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({ob.low:.1f})"
+            for fvg in result.get("fvgs", []):
+                if fvg.type == "bearish" and fvg.lower > price:
+                    if res_high == 0 or fvg.lower < res_high:
+                        res_high = fvg.lower
+                        res_detail = f"FVG baissier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({fvg.lower:.1f})"
+
+        if count == 0 or not support_levels:
+            return None
+
+        # Calcul SL : sous le support le plus proche du prix
+        support_levels.sort()
+        nearest_support = [s for s in support_levels if s < price]
+        if nearest_support:
+            sl_base = max(nearest_support)
+        else:
+            sl_base = min(support_levels)
+        sl_price = sl_base - self.pd_range * 0.15
+
+        # Raison SL
+        sl_buffer = self.pd_range * 0.15
+        sl_reason_parts = []
+        for d in support_details:
+            if str(sl_base) in d or f"{sl_base:.1f}" in d:
+                sl_reason_parts.append(d)
+        if sl_reason_parts:
+            sl_reason = f"SL sous {sl_reason_parts[0]} (support + buffer {sl_buffer:.1f}$)"
+        else:
+            sl_reason = f"SL à {sl_price:.1f}$ sous le support le plus proche ({sl_base:.1f}) + buffer {sl_buffer:.1f}$"
+
+        # Calcul TP : vers la résistance la plus proche, ou Fibonacci 1.272
+        use_fib = True
+        if res_high > 0 and res_high - price > self.pd_range * 0.3:
+            tp1 = res_high
+            tp2 = price + self.pd_range * 1.272
+            tp3 = price + self.pd_range * 1.618
+            use_fib = False
+        else:
+            tp1 = price + self.pd_range * 1.272
+            tp2 = price + self.pd_range * 1.618
+            tp3 = None
+
+        # Raison TP
+        if use_fib:
+            fib_range = self.pd_range
+            tp_reason = f"Extension Fibonacci 1.272× PD range ({fib_range:.1f}$) → {tp1:.1f}$"
+        else:
+            tp_reason = f"Prochaine résistance : {res_detail}"
+
+        # Zone d'entrée : +/- 5% du PD range
+        entry_low = price - self.pd_range * 0.05
+        entry_high = price + self.pd_range * 0.05
+
+        # Raison entrée
+        entry_parts = []
+        if has_ote:
+            entry_parts.append("zone OTE")
+        if has_discount:
+            entry_parts.append("zone Discount")
+        if has_bullish_ob:
+            entry_parts.append("OB haussier")
+        if has_bullish_fvg:
+            entry_parts.append("FVG haussier")
+        if has_ssl_near:
+            entry_parts.append("proximité SSL")
+        htf_str = "favorable" if bias_long > bias_short else "neutre"
+        entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
+
+        # Force du setup
+        avg_strength = strength_sum / count if count > 0 else 0.0
+        has_htf_bias = bias_long > bias_short
+        strength = min(avg_strength * 0.5 + (0.3 if has_discount or has_ote else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
+
+        reason_parts = entry_parts.copy()
+
+        return ProximitySetup(
+            direction="long",
+            entry_low=round(entry_low, 1),
+            entry_high=round(entry_high, 1),
+            stop_loss=round(sl_price, 1),
+            target_1=round(tp1, 1),
+            target_2=round(tp2, 1) if tp2 else None,
+            target_3=round(tp3, 1) if tp3 else None,
+            strength=round(strength, 2),
+            reason=f"Entrée LONG possible — {" + ".join(reason_parts)} — Bias HTF {'favorable' if has_htf_bias else 'neutre'}",
+            entry_reason=entry_reason,
+            sl_reason=sl_reason,
+            tp_reason=tp_reason,
+            concepts=concepts_used,
+            tfs=list(tfs_used),
+        )
+
+    def _build_short_setup(
+        self, alerts: Dict[str, List[ProximityAlert]],
+        analysis: Dict[str, dict],
+        price: float,
+        bias_long: int,
+        bias_short: int,
+    ) -> Optional[ProximitySetup]:
+        """Construit un setup SHORT si les conditions sont réunies."""
+        has_premium = "Premium" in alerts and any(a.is_entry_zone for a in alerts["Premium"])
+        has_bearish_ob = "OB" in alerts and any(
+            a.is_entry_zone and a.direction == "bearish" for a in alerts["OB"]
+        )
+        has_bearish_fvg = "FVG" in alerts and any(
+            a.is_entry_zone and a.direction == "bearish" for a in alerts["FVG"]
+        )
+        has_bsl_near = "BSL" in alerts and any(
+            not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5
+            for a in alerts["BSL"]
+        )
+
+        if not (has_premium or has_bearish_ob or has_bearish_fvg or has_bsl_near):
+            return None
+
+        resistance_levels = []
+        resistance_details = []
+        max_res_dist = self.pd_range * 2.0
+        concepts_used = []
+        tfs_used = set()
+        strength_sum = 0.0
+        count = 0
+
+        for ctype in ["OB", "FVG", "Premium", "BSL"]:
+            if ctype not in alerts:
+                continue
+            for a in alerts[ctype]:
+                if a.direction in ("bearish", "neutral") or a.is_entry_zone:
+                    near_dist = abs(a.price_distance) if not a.is_entry_zone else abs(a.level_high - price)
+                    if near_dist < max_res_dist or a.is_entry_zone:
+                        resistance_levels.append(a.level_high)
+                        resistance_details.append(f"{ctype} {a.tf} ({a.level_low:.1f}-{a.level_high:.1f})")
+                    concepts_used.append(ctype)
+                    tfs_used.add(a.tf)
+                    count += 1
+                    strength_sum += a.strength * (2.0 if a.is_entry_zone else 1.0)
+
+        # Chercher des supports (bullish OB/FVG) dans l'analyse complète
+        sup_low = 0.0
+        sup_detail = ""
+        for tf_name, result in analysis.items():
+            for ob in result.get("order_blocks", []):
+                if ob.type == "bullish" and ob.high < price:
+                    if sup_low == 0 or ob.high > sup_low:
+                        sup_low = ob.high
+                        sup_detail = f"OB haussier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({ob.high:.1f})"
+            for fvg in result.get("fvgs", []):
+                if fvg.type == "bullish" and fvg.upper < price:
+                    if sup_low == 0 or fvg.upper > sup_low:
+                        sup_low = fvg.upper
+                        sup_detail = f"FVG haussier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({fvg.upper:.1f})"
+
+        if count == 0 or not resistance_levels:
+            return None
+
+        # SL au-dessus de la résistance la plus proche du prix
+        resistance_levels.sort(reverse=True)
+        nearest_res = [r for r in resistance_levels if r > price]
+        if nearest_res:
+            sl_base = min(nearest_res)
+        else:
+            sl_base = max(resistance_levels)
+        sl_price = sl_base + self.pd_range * 0.15
+
+        # Raison SL
+        sl_buffer = self.pd_range * 0.15
+        sl_reason_parts = []
+        for d in resistance_details:
+            if str(sl_base) in d or f"{sl_base:.1f}" in d:
+                sl_reason_parts.append(d)
+        if sl_reason_parts:
+            sl_reason = f"SL au-dessus de {sl_reason_parts[0]} (résistance + buffer {sl_buffer:.1f}$)"
+        else:
+            sl_reason = f"SL à {sl_price:.1f}$ au-dessus de la résistance la plus proche ({sl_base:.1f}) + buffer {sl_buffer:.1f}$"
+
+        # TP vers le support le plus proche
+        use_fib = True
+        if sup_low > 0 and price - sup_low > self.pd_range * 0.3:
+            tp1 = sup_low
+            tp2 = price - self.pd_range * 1.272
+            tp3 = price - self.pd_range * 1.618
+            use_fib = False
+        else:
+            tp1 = price - self.pd_range * 1.272
+            tp2 = price - self.pd_range * 1.618
+            tp3 = None
+
+        # Raison TP
+        if use_fib:
+            fib_range = self.pd_range
+            tp_reason = f"Extension Fibonacci 1.272× PD range ({fib_range:.1f}$) → {tp1:.1f}$"
+        else:
+            tp_reason = f"Prochain support : {sup_detail}"
+
+        entry_low = price - self.pd_range * 0.05
+        entry_high = price + self.pd_range * 0.05
+
+        # Raison entrée
+        entry_parts = []
+        if has_premium:
+            entry_parts.append("zone Premium")
+        if has_bearish_ob:
+            entry_parts.append("OB baissier")
+        if has_bearish_fvg:
+            entry_parts.append("FVG baissier")
+        if has_bsl_near:
+            entry_parts.append("proximité BSL")
+        htf_str = "favorable" if bias_short > bias_long else "neutre"
+        entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
+
+        avg_strength = strength_sum / count if count > 0 else 0.0
+        has_htf_bias = bias_short > bias_long
+        strength = min(avg_strength * 0.5 + (0.3 if has_premium else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
+
+        reason_parts = entry_parts.copy()
+
+        return ProximitySetup(
+            direction="short",
+            entry_low=round(entry_low, 1),
+            entry_high=round(entry_high, 1),
+            stop_loss=round(sl_price, 1),
+            target_1=round(tp1, 1),
+            target_2=round(tp2, 1) if tp2 else None,
+            target_3=round(tp3, 1) if tp3 else None,
+            strength=round(strength, 2),
+            reason=f"Entrée SHORT possible — {" + ".join(reason_parts)} — Bias HTF {'favorable' if has_htf_bias else 'neutre'}",
+            entry_reason=entry_reason,
+            sl_reason=sl_reason,
+            tp_reason=tp_reason,
+            concepts=concepts_used,
+            tfs=list(tfs_used),
+        )
+
+    # ─── Résumé formaté ────────────────────────────────────────────────────
 
     def get_summary(self, alerts: Dict[str, List[ProximityAlert]]) -> str:
         """Résumé formaté des alertes de proximité."""

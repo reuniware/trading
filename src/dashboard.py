@@ -579,6 +579,48 @@ def render_dashboard():
     else:
         st.info("Aucune proximité ICT détectée.")
 
+    # ─── Row 7: Setups de Trading ──────────────────────────────────────────
+    st.divider()
+    st.subheader("🎯 Setups de Trading (Proximité ICT)")
+    setups = analysis.get("proximity_setups", [])
+    if setups:
+        col_setups = st.columns(2)
+        for i, s in enumerate(setups[:2]):
+            with col_setups[i % 2]:
+                direction_icon = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
+                direction_color = "#00ff88" if s.direction == "long" else "#ff4444"
+                bg = "rgba(0,255,136,0.05)" if s.direction == "long" else "rgba(255,68,68,0.05)"
+                border = "1px solid rgba(0,255,136,0.2)" if s.direction == "long" else "1px solid rgba(255,68,68,0.2)"
+                rr = s.risk_reward()
+                tp2_str = f"<div><span style='color:#888;'>TP2</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_2:.1f}</span></div>" if s.target_2 else ""
+                tp3_str = f"<div><span style='color:#888;'>TP3</span><br><span style='color:{direction_color};font-weight:600;'>{s.target_3:.1f}</span></div>" if s.target_3 else ""
+
+                st.markdown(
+                    f'<div style="background:{bg};border:{border};border-radius:12px;'
+                    f'padding:16px;margin:8px 0;">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                    f'<h3 style="color:{direction_color};margin:0;">{direction_icon}</h3>'
+                    f'<span style="color:#ffaa00;font-weight:600;">Force: {s.strength:.0%} | R:R: {rr}</span>'
+                    f'</div>'
+                    f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px;">'
+                    f'<div><span style="color:#888;">Entrée</span><br><span style="color:#fff;font-weight:600;">{s.entry_low:.1f}-{s.entry_high:.1f}</span></div>'
+                    f'<div><span style="color:#888;">SL</span><br><span style="color:#ff4444;font-weight:600;">{s.stop_loss:.1f}</span></div>'
+                    f'<div><span style="color:#888;">TP1</span><br><span style="color:{direction_color};font-weight:600;">{s.target_1:.1f}</span></div>'
+                    f'{tp2_str}'
+                    f'{tp3_str}'
+                    f'</div>'
+                    f'<div style="margin-top:10px;font-size:0.8rem;">'
+                    f'<div><span style="color:#888;">🎯 Entrée :</span> <span style="color:#ccc;">{s.entry_reason}</span></div>'
+                    f'<div><span style="color:#888;">🛑 SL :</span> <span style="color:#ccc;">{s.sl_reason}</span></div>'
+                    f'<div><span style="color:#888;">🎯 TP :</span> <span style="color:#ccc;">{s.tp_reason}</span></div>'
+                    f'</div>'
+                    f'<p style="margin:6px 0 0 0;color:#888;font-size:0.75rem;">{s.reason}</p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("Aucun setup de trading basé sur la proximité ICT.")
+
     # ─── Footer auto-refresh ──────────────────────────────────────────
     st.divider()
     st.caption(f"🔄 Dernière mise à jour: {analysis.get('timestamp', 'N/A')} | "

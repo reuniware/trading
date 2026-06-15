@@ -152,6 +152,28 @@ def cmd_scan(args):
     else:
         print("  Aucune proximité ICT détectée.")
 
+    # Setups de trading
+    setups = analysis.get("proximity_setups", [])
+    if setups:
+        print()
+        print("🎯 SETUPS DE TRADING")
+        print("-" * 60)
+        for s in setups:
+            direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
+            rr = s.risk_reward()
+            strength_pct = f"{s.strength:.0%}"
+            tp2_str = f" | TP2: {s.target_2:.1f}" if s.target_2 else ""
+            tp3_str = f" | TP3: {s.target_3:.1f}" if s.target_3 else ""
+
+            print(f"\n  {direction} | Force: {strength_pct} | R:R: {rr}")
+            print(f"    ├─ Entrée: {s.entry_low:.1f} - {s.entry_high:.1f}")
+            print(f"    │  {s.entry_reason}")
+            print(f"    ├─ SL:     {s.stop_loss:.1f}")
+            print(f"    │  {s.sl_reason}")
+            print(f"    ├─ TP1:    {s.target_1:.1f}{tp2_str}{tp3_str}")
+            print(f"    │  {s.tp_reason}")
+            print(f"    └─ {s.reason}")
+
     print()
 
 
@@ -231,12 +253,47 @@ def cmd_dashboard(args):
     """Lance le dashboard Streamlit."""
     import subprocess
     import os
+    import shutil
+
+    # Tue les anciens processus Streamlit sur le port 8501
+    print("🧹 Nettoyage des anciens processus Streamlit...")
+    try:
+        result = subprocess.run(['netstat', '-ano'], capture_output=True, timeout=10)
+        output = result.stdout.decode('utf-8', errors='replace')
+        for line in output.splitlines():
+            if ':8501' in line and 'LISTENING' in line:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    pid = parts[-1]
+                    try:
+                        subprocess.run(['taskkill.exe', '/f', '/pid', pid], capture_output=True, timeout=5)
+                        print(f"  ✓ Tué PID {pid}")
+                    except Exception:
+                        print(f"  ⚠ Impossible de tuer PID {pid}")
+    except Exception as e:
+        print(f"  ⚠ Erreur nettoyage: {e}")
+
+    # Nettoie tous les caches .pyc du projet
+    for root, dirs, files in os.walk('.'):
+        if '.git' in root or '.venv' in root:
+            continue
+        # Supprime les dossiers __pycache__
+        for d in dirs[:]:
+            if d == '__pycache__':
+                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+        # Supprime les fichiers .pyc orphelins
+        for f in files:
+            if f.endswith('.pyc'):
+                try:
+                    os.remove(os.path.join(root, f))
+                except:
+                    pass
 
     print("🚀 Lancement du dashboard Streamlit...")
     print("📊 http://localhost:8501\n")
 
     subprocess.run([
-        sys.executable, "-m", "streamlit", "run",
+        sys.executable, "-B", "-m", "streamlit", "run",
         os.path.join(os.path.dirname(__file__), "src", "dashboard.py"),
         "--server.headless", "true",
         "--browser.gatherUsageStats", "false",
