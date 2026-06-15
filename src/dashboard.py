@@ -404,6 +404,78 @@ def render_dashboard():
         unsafe_allow_html=True,
     )
 
+    # ─── Row 1: Explications ICT (expandeur) ────────────────────────────
+    with st.expander("📖 Guide ICT — Killzones & Macro", expanded=False):
+        kz_now = macro.get("active_killzone", "")
+
+        def _kz_row(emoji, name, utc, desc, active_kz):
+            """Génère une ligne de tableau killzone avec mise en évidence si active."""
+            if name == active_kz:
+                return f"| 🟢👉 **{emoji} {name}** | {utc} | **{desc}** |"
+            return f"| {emoji} {name} | {utc} | {desc} |"
+
+        def _att_li(name, advice, active_kz):
+            """Génère une ligne d'attitude avec highlight si active."""
+            if name == active_kz:
+                return f"- 🟢👉 **{name} → {advice}** *(actif maintenant)*"
+            return f"- **{name}** → {advice}"
+
+        kz_info = [
+            ("🌏", "Asie", "22:00–08:00", "Faible volatilité, ranges, pose les niveaux du jour", "Observer, scalping léger, poser les niveaux"),
+            ("🇬🇧", "Londres", "07:00–16:00", "Très volatile, trends directionnels, gros volume", "Trader les trends, entrées sur retraits OB/FVG"),
+            ("🇺🇸", "New York", "13:00–21:00", "Pic d'activité (chevauchement Londres 13–16h), liquidité chassée", "Attendre la liquidité (BSL/SSL), reversals possibles"),
+            ("🔥", "Silver Bullet NY", "13:30–15:00", "Fenêtre la plus précise, mouvements puissants 1.618+ PD Array", "Entrée sur première impulsion, targets 1.272 PD Array"),
+        ]
+
+        col_kz, col_macro = st.columns([1, 1])
+
+        with col_kz:
+            # Tableau des killzones avec la ligne active en évidence
+            kz_rows = "\n".join(_kz_row(*k[:4], kz_now) for k in kz_info)
+            st.markdown(f"""**🔫 Kill Zones** — Créneaux horaires à forte activité
+
+| Zone | UTC | Comportement |
+|------|-----|--------------|
+{kz_rows}
+""")
+
+            # Attitude avec la ligne active en évidence
+            att_lines = "\n".join(_att_li(k[1], k[4], kz_now) for k in kz_info)
+            st.markdown(f"**Attitude par killzone :**\n{att_lines}")
+
+            if kz_now:
+                # Message spécifique à la killzone active
+                kz_advice_map = {k[1]: k[4] for k in kz_info}
+                advice = kz_advice_map.get(kz_now, "Adapte ta stratégie au contexte")
+                st.info(f"🟢 **{kz_now} active** — {advice}")
+
+        with col_macro:
+            macro_bias = macro.get("macro_bias", "neutral")
+            mb_hl = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}.get(macro_bias, "")
+
+            st.markdown(f"""**📊 Macro ICT** — Contexte global du marché
+
+| Macro | Zone | Attitude |
+|-------|------|----------|
+| {'🟢👉 **HAUSSIÈRE**' if macro_bias == 'bullish' else '🟢 HAUSSIÈRE'} | Discount (bas du range) | Acheter les retraits vers OB/FVG haussiers |
+| {'🔴👉 **BAISSIÈRE**' if macro_bias == 'bearish' else '🔴 BAISSIÈRE'} | Premium (haut du range) | Vendre les rallies vers OB/FVG baissiers |
+| {'🟡👉 **NEUTRE**' if macro_bias == 'neutral' else '🟡 NEUTRE'} | Équilibre | Prudence, scalping, attendre Discount/Premium |
+
+**Combinaison killzone + macro :**
+| Macro | Killzone | Action |
+|-------|----------|-------|
+| 🟢 Haussière | Londres → | Acheter les retraits |
+| 🟢 Haussière | Silver Bullet → | Long sur première impulsion NY |
+| 🔴 Baissière | New York → | Vendre les rallies |
+| 🟡 Neutre | Asie → | Observation, poser les niveaux |
+""")
+
+            if macro_bias != "neutral":
+                zone_label = {"discount": "Zone Discount (achat)", "premium": "Zone Premium (vente)", "equilibrium": "l'Équilibre"}.get(macro.get("price_zone", ""), "")
+                st.info(f"{mb_hl} **Macro {macro_bias.upper()}** — Prix en {zone_label}. Suis l'attitude recommandée ci-dessus.")
+
+        st.caption("💡 Les killzones indiquent **quand** trader, la macro indique **dans quelle direction**. Les deux combinées = le plan de trading.")
+
     cols = st.columns([1, 1, 1, 1, 1, 1])
     price = analysis.get("current_price", {})
     account = analysis.get("account")

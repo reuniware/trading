@@ -85,9 +85,12 @@ trading/
 - Performance 30 jours + Totale
 - Courbe d'equity
 - Matrice des biases multi-TF
-- Sessions et Silver Bullet
-- **📍 Proximité ICT** : détection des concepts proches du prix sur tous les TFs
-- **🎯 Setups de trading** : suggestions LONG/SHORT avec SL, TP et raisons détaillées
+- **⏱️ Timeframes sélectionnables** : cases à cocher dans la sidebar pour filtrer les TFs analysés
+- **🕐 Sessions et Silver Bullet** : badges avec décomptes ouverture/fermeture
+- **📊 Bannière Macro ICT** : contexte global (Haussière/Baissière/Neutre) + zone de prix + killzone active + décompte
+- **📍 Proximité ICT** : tableau DataFrame structuré (Concept, TF, Direction, Zone, Distance, Force)
+- **🎯 Setups de trading** : tableau DataFrame complet (Direction, Force, R:R, TFs, Entrée, SL, TP1-3, Raisons)
+- **📖 Guide ICT intégré** : expandeur avec explications des killzones et macro, mise en évidence dynamique de la session active
 
 ---
 
