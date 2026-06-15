@@ -545,6 +545,40 @@ def render_dashboard():
         st.warning("⚠️ **Conflit de Timeframes** : " + " | ".join(analysis["conflicts"]))
         st.caption("Les TF longs sont en conflit avec les TF courts — signe de prudence")
 
+    # ─── Row 6: Proximité ICT ──────────────────────────────────────────────
+    st.divider()
+    st.subheader("📍 Proximité ICT")
+    proximity = analysis.get("proximity", {})
+    if proximity:
+        order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        icons = {
+            "OTE": "🎯", "OB": "🧱", "FVG": "🕳️", "Discount": "🟢",
+            "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
+        }
+        col_prox = st.columns(3)
+        col_idx = 0
+        for ctype in order:
+            if ctype not in proximity:
+                continue
+            with col_prox[col_idx % 3]:
+                icon = icons.get(ctype, "📍")
+                st.markdown(f"**{icon} {ctype}**")
+                for a in proximity[ctype][:2]:
+                    entry_tag = " 🎯" if a.is_entry_zone else ""
+                    color = "#00ff88" if a.direction == "bullish" else ("#ff4444" if a.direction == "bearish" else "#ffaa00")
+                    st.markdown(
+                        f'<div class="metric-card" style="padding:10px;margin:4px 0;border-left:3px solid {color};">'
+                        f'<div style="font-size:0.75rem;color:#888;">{a.tf}</div>'
+                        f'<div style="font-size:0.85rem;color:#ccc;">{a.detail[:60]}</div>'
+                        f'<div style="font-size:0.9rem;color:{color};font-weight:600;">'
+                        f'{a.distance_label()}{entry_tag}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                col_idx += 1
+    else:
+        st.info("Aucune proximité ICT détectée.")
+
     # ─── Footer auto-refresh ──────────────────────────────────────────
     st.divider()
     st.caption(f"🔄 Dernière mise à jour: {analysis.get('timestamp', 'N/A')} | "

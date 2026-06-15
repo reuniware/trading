@@ -128,6 +128,30 @@ def cmd_scan(args):
     if analysis["sessions"].get("silver_bullet_active"):
         print("  🔥 Silver Bullet NY active !")
 
+    # Proximité ICT
+    print()
+    print("📍 PROXIMITÉS ICT")
+    print("-" * 55)
+    proximity = analysis.get("proximity", {})
+    if proximity:
+        order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        icons = {
+            "OB": "🧱", "FVG": "🕳️", "OTE": "🎯", "Discount": "🟢",
+            "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
+        }
+        for ctype in order:
+            if ctype not in proximity:
+                continue
+            items = proximity[ctype]
+            icon = icons.get(ctype, "📍")
+            print(f"  {icon} {ctype}")
+            for a in items[:2]:  # max 2 par type
+                entry_tag = " ✅" if a.is_entry_zone else ""
+                print(f"    ├─ {a.detail}")
+                print(f"    └─ Distance: {a.distance_label()}{entry_tag}")
+    else:
+        print("  Aucune proximité ICT détectée.")
+
     print()
 
 

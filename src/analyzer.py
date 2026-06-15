@@ -16,6 +16,7 @@ from .ict_concepts import MultiTimeframeAnalyzer, DiscountPremium
 from .sessions import SessionDetector
 from .account_monitor import AccountMonitor
 from .signal_generator import SignalGenerator
+from .proximity import PriceProximityAnalyzer
 
 logger = logging.getLogger("Analyzer")
 
@@ -71,7 +72,13 @@ class ICTAnalyzer:
             "time": latest_price.get("time", datetime.now()) if latest_price else datetime.now(),
         }
 
-        # 7. Compte
+        # 7. Proximité ICT (prix vs concepts)
+        price_val = current.get("bid", 0) or current.get("ask", 0)
+        pd_range = self._get_pd_array_range(data)
+        prox_analyzer = PriceProximityAnalyzer(pd_array_range=pd_range)
+        proximity = prox_analyzer.analyze(price_val, analysis)
+
+        # 8. Compte
         account_stats = self.account.get_account_stats()
 
         return {
@@ -84,6 +91,7 @@ class ICTAnalyzer:
             "conflicts": conflicts,
             "signals": signals,
             "sessions": session_stats,
+            "proximity": proximity,
             "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current),
         }
 
@@ -125,6 +133,14 @@ class ICTAnalyzer:
             "liquidity": analysis.get("liquidity", []),
             "discount_premium": analysis.get("discount_premium"),
         }
+
+    def _get_pd_array_range(self, data: Dict) -> float:
+        """Calcule le PD Array range (10 dernieres bougies M15)."""
+        for tf in ["M15", "M5", "H1"]:
+            if tf in data and data[tf] is not None and len(data[tf]) >= 10:
+                df = data[tf].tail(10)
+                return float(df["high"].max() - df["low"].min())
+        return 50.0
 
     def _get_market_structure(self, df: pd.DataFrame) -> str:
         """Détermine la structure de marché (HH/HL, LH/LL)."""
@@ -277,7 +293,39 @@ class ICTAnalyzer:
                 lines.append(f"- Zone Premium: {dp.premium_low:.1f} - {dp.premium_high:.1f}")
                 lines.append("")
 
-        # Partie 3: Sessions
+        # Partie 3: Proximité ICT
+        proximity = analysis.get("proximity", {})
+        if proximity:
+            lines.append("## 📍 PROXIMITÉ ICT (prix vs concepts)")
+            lines.append("")
+            lines.append("| Concept | Timeframe | Zone | Distance | Force |")
+            lines.append("|---------|-----------|------|----------|-------|")
+            order = ["OTE", "OB", "FVG", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+            for ctype in order:
+                if ctype not in proximity:
+                    continue
+                for a in proximity[ctype][:2]:
+                    entry_str = " 🎯" if a.is_entry_zone else ""
+                    dist_str = a.distance_label()
+                    lines.append(f"| **{ctype}** | {TIMEFRAME_LABELS.get(a.tf, a.tf)} | "
+                                 f"{a.direction.upper()} | {dist_str}{entry_str} | {a.strength:.0%} |")
+
+            # Détails supplémentaires
+            lines.append("")
+            lines.append("### Détails des proximités")
+            lines.append("")
+            for ctype in order:
+                if ctype not in proximity:
+                    continue
+                lines.append(f"**{ctype}:**")
+                for a in proximity[ctype][:2]:
+                    entry_tag = " ✅ PRIX DANS LA ZONE" if a.is_entry_zone else ""
+                    lines.append(f"- {a.detail}")
+                    lines.append(f"  - Distance: {a.distance_label()}{entry_tag}")
+                    lines.append(f"  - Zone: {a.level_low:.1f} – {a.level_high:.1f}")
+                lines.append("")
+
+        # Partie 4: Sessions
         lines.append("## 🕐 SESSIONS & KILL ZONES")
         lines.append("")
         for s in analysis["sessions"].get("active_sessions", []):
