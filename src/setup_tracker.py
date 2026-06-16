@@ -8,6 +8,7 @@ Fonctionne en mémoire (session Streamlit) + persistance JSON optionnelle.
 
 import json
 import logging
+import math
 import os
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field, asdict
@@ -19,7 +20,7 @@ logger = logging.getLogger("SetupTracker")
 
 @dataclass
 class TrackedSetup:
-    """Un setup de trading suivi dans le temps."""
+    """Un setup de trading suivi dans le temps avec contexte complet pour analyse prédictive."""
     id: str
     symbol: str
     direction: str           # "long" | "short"
@@ -39,6 +40,20 @@ class TrackedSetup:
     outcome_at: Optional[str] = None
     bars_to_outcome: int = 0
     price_path: List[float] = field(default_factory=list)  # Historique des prix
+    # ─── Contexte de marché au moment de la détection ───
+    killzone_active: str = ""        # "Asie", "Londres", "New York", "Silver Bullet NY"
+    macro_bias: str = ""             # "bullish", "bearish", "neutral"
+    price_zone: str = ""             # "discount", "premium", "equilibrium"
+    pd_array_range: float = 0.0      # Range du PD Array (volatilité)
+    killzone_conformity_score: float = 0.0  # 0-1
+    nb_tfs_bullish: int = 0
+    nb_tfs_bearish: int = 0
+    nb_tfs_neutral: int = 0
+    nb_tfs_total: int = 0
+    day_of_week: int = 0             # 0=Lundi, 4=Vendredi, 6=Dimanche
+    hour_of_day: int = 0             # 0-23
+    sweep_present: bool = False      # Sweep récent sur key level ?
+    proximity_concepts_json: str = ""  # JSON: {"OB":3, "FVG":2, "BSL":1, ...}
 
     @property
     def entry_mid(self) -> float:
@@ -116,7 +131,8 @@ class SetupTracker:
     def __init__(self, storage_path: Optional[str] = None):
         self.setups: Dict[str, TrackedSetup] = {}
         self.storage_path = storage_path
-        self._max_setups = 500          # Garder max 500 setups en mémoire
+        self._max_active = 200           # Max setups actifs en mémoire
+        self._max_completed = 10000      # Max setups terminés (historique)
         self._expiry_hours = 168         # Expiration après 7 jours
         if storage_path:
             self._load()
@@ -127,14 +143,23 @@ class SetupTracker:
         current_price: float,
         symbol: str = "XAUUSD",
         source: str = "proximity",
+        context: Optional[Dict] = None,
     ) -> List[str]:
         """
-        Enregistre de nouveaux setups pour suivi.
+        Enregistre de nouveaux setups pour suivi avec contexte de marché.
         Évite les doublons (même direction + prix proche + détection récente).
+        
+        Args:
+            context: dict optionnel avec les clés:
+                killzone_active, macro_bias, price_zone, pd_array_range,
+                killzone_conformity_score, nb_tfs_bullish/bearish/neutral/total,
+                day_of_week, hour_of_day, sweep_present, proximity_concepts
         Retourne les IDs créés.
         """
         new_ids = []
-        now = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        ctx = context or {}
 
         for s in setups:
             # Éviter les doublons : vérifier si un setup similaire existe déjà
@@ -182,6 +207,20 @@ class SetupTracker:
                 source=source,
                 status="active",
                 price_path=[current_price],
+                # Contexte de marché
+                killzone_active=ctx.get("killzone_active", ""),
+                macro_bias=ctx.get("macro_bias", ""),
+                price_zone=ctx.get("price_zone", ""),
+                pd_array_range=ctx.get("pd_array_range", 0.0),
+                killzone_conformity_score=ctx.get("killzone_conformity_score", 0.0),
+                nb_tfs_bullish=ctx.get("nb_tfs_bullish", 0),
+                nb_tfs_bearish=ctx.get("nb_tfs_bearish", 0),
+                nb_tfs_neutral=ctx.get("nb_tfs_neutral", 0),
+                nb_tfs_total=ctx.get("nb_tfs_total", 0),
+                day_of_week=ctx.get("day_of_week", now_dt.weekday()),
+                hour_of_day=ctx.get("hour_of_day", now_dt.hour),
+                sweep_present=ctx.get("sweep_present", False),
+                proximity_concepts_json=ctx.get("proximity_concepts_json", ""),
             )
             self.setups[setup_id] = tracked
             new_ids.append(setup_id)
@@ -356,6 +395,244 @@ class SetupTracker:
             "worst_strength": worst_setup.strength if worst_setup else 0,
         }
 
+    def find_similar_setups(
+        self, current_context: Dict, direction: str, top_n: int = 5,
+    ) -> List[Dict]:
+        """
+        Compare le contexte actuel aux setups gagnants passés et retourne
+        les plus similaires avec leur score de similarité et outcome.
+        
+        Utilisé pour évaluer si le setup actuel ressemble à des setups
+        historiquement gagnants (fort potentiel) ou perdants (risque élevé).
+        
+        Retourne une liste de dicts triés par similarité décroissante :
+        [{setup_id, direction, outcome, win, similarity_score, match_details, ...}]
+        """
+        completed = [
+            s for s in self.setups.values()
+            if s.status.startswith("win_") or s.status == "loss"
+        ]
+        if not completed:
+            return []
+
+        # Construire le vecteur de features du contexte actuel
+        target_vec = self._context_to_vector(current_context, direction)
+
+        results = []
+        for s in completed:
+            hist_ctx = {
+                "direction": s.direction,
+                "killzone_active": s.killzone_active,
+                "macro_bias": s.macro_bias,
+                "price_zone": s.price_zone,
+                "pd_array_range": s.pd_array_range,
+                "killzone_conformity_score": s.killzone_conformity_score,
+                "nb_tfs_bullish": s.nb_tfs_bullish,
+                "nb_tfs_bearish": s.nb_tfs_bearish,
+                "nb_tfs_neutral": s.nb_tfs_neutral,
+                "day_of_week": s.day_of_week,
+                "hour_of_day": s.hour_of_day,
+                "sweep_present": s.sweep_present,
+                "strength": s.strength,
+                "source": s.source,
+                "proximity_concepts_json": s.proximity_concepts_json,
+            }
+            hist_vec = self._context_to_vector(hist_ctx, s.direction)
+            similarity = self._cosine_similarity(target_vec, hist_vec)
+
+            # Bonus si même direction
+            if s.direction == direction:
+                similarity += 0.1
+            # Bonus si même source
+            if s.source == current_context.get("source", ""):
+                similarity += 0.05
+
+            results.append({
+                "setup_id": s.id,
+                "direction": s.direction,
+                "outcome": s.status,
+                "win": s.status.startswith("win_"),
+                "similarity_score": round(min(similarity, 1.0), 3),
+                "detected_at": s.detected_at,
+                "entry_mid": s.entry_mid,
+                "strength": s.strength,
+                "killzone_active": s.killzone_active,
+                "macro_bias": s.macro_bias,
+                "source": s.source,
+            })
+
+        # Trier par similarité décroissante
+        results.sort(key=lambda r: r["similarity_score"], reverse=True)
+        return results[:top_n]
+
+    def get_predictive_score(self, current_context: Dict, direction: str) -> Dict:
+        """
+        Score prédictif basé sur l'historique :
+        - Cherche les 10 setups passés les plus similaires
+        - Calcule le win rate et le R:R moyen de ces setups similaires
+        - Compare au win rate global pour déterminer si le contexte est favorable
+        
+        Retourne un dict avec predictive_score (0-100), confidence, et détails.
+        """
+        similar = self.find_similar_setups(current_context, direction, top_n=10)
+        if len(similar) < 3:
+            return {
+                "predictive_score": 50,
+                "confidence": "low",
+                "similar_count": len(similar),
+                "similar_win_rate": 0,
+                "similar_avg_rr": 0,
+                "global_win_rate": 0,
+                "verdict": "Pas assez d'historique similaire pour évaluer",
+            }
+
+        # Win rate des setups similaires
+        similar_wins = sum(1 for s in similar if s["win"])
+        similar_win_rate = similar_wins / len(similar) * 100
+
+        # R:R moyen des setups similaires gagnants
+        similar_rrs = []
+        for s in similar:
+            if s["win"]:
+                setup = self.setups.get(s["setup_id"])
+                if setup:
+                    rr = setup.risk_reward()
+                    if rr > 0:
+                        similar_rrs.append(rr)
+        similar_avg_rr = sum(similar_rrs) / len(similar_rrs) if similar_rrs else 0
+
+        # Win rate global
+        stats = self.get_stats()
+        global_win_rate = stats.get("win_rate", 0)
+        global_avg_rr = stats.get("avg_rr_realized", 0)
+
+        # Score prédictif : combinaison du win rate similaire vs global et R:R
+        wr_bonus = (similar_win_rate - global_win_rate) / 2  # ±50 max
+        rr_bonus = (similar_avg_rr - global_avg_rr) * 10 if global_avg_rr > 0 else 0  # ±30 max
+        base_score = 50
+        predictive_score = max(0, min(100, base_score + wr_bonus + rr_bonus))
+
+        # Confiance basée sur le nombre d'échantillons similaires
+        if len(similar) >= 8:
+            confidence = "high"
+        elif len(similar) >= 5:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Verdict
+        if predictive_score >= 65:
+            verdict = "✅ Contexte favorable — setups similaires gagnants dans le passé"
+        elif predictive_score >= 45:
+            verdict = "⚠️ Contexte neutre — résultats mitigés dans des conditions similaires"
+        else:
+            verdict = "❌ Contexte défavorable — setups similaires souvent perdants"
+
+        return {
+            "predictive_score": round(predictive_score, 1),
+            "confidence": confidence,
+            "similar_count": len(similar),
+            "similar_win_rate": round(similar_win_rate, 1),
+            "similar_avg_rr": round(similar_avg_rr, 2),
+            "global_win_rate": round(global_win_rate, 1),
+            "global_avg_rr": round(global_avg_rr, 2),
+            "verdict": verdict,
+            "top_similar": similar[:3],
+        }
+
+    @staticmethod
+    def _context_to_vector(ctx: Dict, direction: str) -> List[float]:
+        """Convertit un contexte en vecteur de features numériques pour comparaison."""
+        vec = []
+
+        # Killzone active (one-hot: asia, london, ny, silver_bullet)
+        kz = ctx.get("killzone_active", "")
+        vec.append(1.0 if "Asie" in kz else 0.0)
+        vec.append(1.0 if "Londres" in kz else 0.0)
+        vec.append(1.0 if ("New York" in kz and "Silver" not in kz) else 0.0)
+        vec.append(1.0 if "Silver" in kz else 0.0)
+
+        # Macro bias (one-hot: bullish, bearish, neutral)
+        mb = ctx.get("macro_bias", "")
+        vec.append(1.0 if mb == "bullish" else 0.0)
+        vec.append(1.0 if mb == "bearish" else 0.0)
+        vec.append(1.0 if mb == "neutral" else 0.0)
+
+        # Price zone (one-hot: discount, premium, equilibrium)
+        pz = ctx.get("price_zone", "")
+        vec.append(1.0 if pz == "discount" else 0.0)
+        vec.append(1.0 if pz == "premium" else 0.0)
+        vec.append(1.0 if pz == "equilibrium" else 0.0)
+
+        # Direction (one-hot: long, short)
+        vec.append(1.0 if direction == "long" else 0.0)
+        vec.append(1.0 if direction == "short" else 0.0)
+
+        # Source (one-hot: signal, proximity, sweep, keylevel)
+        src = ctx.get("source", "")
+        vec.append(1.0 if src == "signal" else 0.0)
+        vec.append(1.0 if src == "proximity" else 0.0)
+        vec.append(1.0 if src == "sweep" else 0.0)
+        vec.append(1.0 if src == "keylevel" else 0.0)
+
+        # Sweep present
+        vec.append(1.0 if ctx.get("sweep_present") else 0.0)
+
+        # Day of week (normalisé 0-1, cyclique: cos/sin encoding)
+        dow = ctx.get("day_of_week", 0)
+        vec.append(math.cos(2 * math.pi * dow / 7))
+        vec.append(math.sin(2 * math.pi * dow / 7))
+
+        # Hour of day (normalisé 0-1, cyclique)
+        hod = ctx.get("hour_of_day", 12)
+        vec.append(math.cos(2 * math.pi * hod / 24))
+        vec.append(math.sin(2 * math.pi * hod / 24))
+
+        # Features numériques normalisés
+        pd_range = ctx.get("pd_array_range", 50)
+        vec.append(min(pd_range / 200.0, 1.0))  # PD range normalisé
+
+        kz_conf = ctx.get("killzone_conformity_score", 0)
+        vec.append(kz_conf)  # Déjà entre 0 et 1
+
+        strength = ctx.get("strength", 0.5)
+        vec.append(strength)  # Déjà entre 0 et 1
+
+        # TF alignment (normalisé)
+        nb_total = ctx.get("nb_tfs_total", 8)
+        if nb_total > 0:
+            vec.append(ctx.get("nb_tfs_bullish", 0) / nb_total)
+            vec.append(ctx.get("nb_tfs_bearish", 0) / nb_total)
+            vec.append(ctx.get("nb_tfs_neutral", 0) / nb_total)
+        else:
+            vec.extend([0, 0, 0])
+
+        # Concepts de proximité (si JSON présent, compter les types)
+        concepts_json = ctx.get("proximity_concepts_json", "")
+        concept_types = ["OB", "FVG", "OTE", "BSL", "SSL", "MSS", "GAP", "Discount", "Premium"]
+        concept_counts = {}
+        if concepts_json:
+            try:
+                concept_counts = json.loads(concepts_json)
+            except Exception:
+                pass
+        for ct in concept_types:
+            vec.append(min(concept_counts.get(ct, 0) / 5.0, 1.0))
+
+        return vec
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        """Calcule la similarité cosinus entre deux vecteurs."""
+        if len(a) != len(b) or len(a) == 0:
+            return 0.0
+        dot = sum(ai * bi for ai, bi in zip(a, b))
+        norm_a = math.sqrt(sum(ai * ai for ai in a))
+        norm_b = math.sqrt(sum(bi * bi for bi in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
     def get_recent_activity(self, hours: float = 24) -> Dict:
         """Activité récente (setups créés, outcomes) sur les dernières heures."""
         now = datetime.now()
@@ -382,17 +659,38 @@ class SetupTracker:
         }
 
     def _prune(self):
-        """Supprime les vieux setups pour limiter la mémoire."""
-        if len(self.setups) <= self._max_setups:
-            return
-        # Garder les plus récents
-        sorted_ids = sorted(
-            self.setups.keys(),
-            key=lambda sid: self.setups[sid].detected_at,
-            reverse=True,
-        )
-        for sid in sorted_ids[self._max_setups:]:
+        """Nettoie les vieux setups actifs expirés. Ne supprime JAMAIS les setups terminés (historique)."""
+        # 1. Supprimer les setups actifs expirés
+        now = datetime.now()
+        expired_ids = []
+        for sid, s in self.setups.items():
+            if s.status == "active":
+                try:
+                    detected_at = datetime.fromisoformat(s.detected_at) if s.detected_at else now
+                except Exception:
+                    detected_at = now
+                hours_elapsed = (now - detected_at).total_seconds() / 3600
+                if hours_elapsed > self._expiry_hours:
+                    expired_ids.append(sid)
+        for sid in expired_ids:
             del self.setups[sid]
+
+        # 2. Si encore trop d'actifs, supprimer les plus anciens (mais jamais les terminés)
+        active = [s for s in self.setups.values() if s.status == "active"]
+        if len(active) > self._max_active:
+            active.sort(key=lambda s: s.detected_at)
+            for s in active[:len(active) - self._max_active]:
+                del self.setups[s.id]
+
+        # 3. Si trop de terminés, supprimer les plus anciens (historique long terme préservé)
+        completed = [s for s in self.setups.values() if s.status.startswith("win_") or s.status == "loss"]
+        if len(completed) > self._max_completed:
+            completed.sort(key=lambda s: s.outcome_at or s.detected_at)
+            for s in completed[:len(completed) - self._max_completed]:
+                del self.setups[s.id]
+
+        if expired_ids:
+            logger.info("🧹 %d setups actifs expirés supprimés", len(expired_ids))
 
     def _save(self):
         """Sauvegarde en JSON."""

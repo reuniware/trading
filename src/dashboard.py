@@ -967,6 +967,7 @@ def render_dashboard():
 
     tracker_stats = analysis.get("setup_tracker_stats", {})
     tracker_active = analysis.get("setup_tracker_active", [])
+    predictive = analysis.get("predictive_score", {})
 
     col_track_stats, col_track_active = st.columns([1, 2])
 
@@ -1013,6 +1014,42 @@ def render_dashboard():
                 total_src = counts.get("wins", 0) + counts.get("losses", 0)
                 wr_src = counts.get("wins", 0) / total_src * 100 if total_src > 0 else 0
                 st.caption(f"  {src}: {counts.get('wins', 0)}W/{counts.get('losses', 0)}L ({wr_src:.0f}%)")
+
+        # Score prédictif (basé sur l'historique similaire)
+        if predictive and predictive.get("similar_count", 0) >= 3:
+            st.divider()
+            st.markdown("#### 🔮 Score Prédictif")
+            pred_score = predictive.get("predictive_score", 50)
+            pred_conf = predictive.get("confidence", "low")
+            pred_color = (
+                "#00ff88" if pred_score >= 65 else
+                "#ffaa00" if pred_score >= 45 else "#ff4444"
+            )
+            conf_badge = {"high": "✅ Fiable", "medium": "⚠️ Modéré", "low": "❓ Limité"}.get(pred_conf, "")
+            st.markdown(
+                f'<div style="border:1px solid {pred_color};border-radius:8px;padding:12px;text-align:center;">'
+                f'<div style="font-size:0.7rem;color:#888;text-transform:uppercase;">'
+                f'Basé sur {predictive.get("similar_count", 0)} setups similaires</div>'
+                f'<div style="font-size:1.3rem;color:{pred_color};font-weight:700;">'
+                f'{predictive["verdict"]}</div>'
+                f'<div style="font-size:0.8rem;color:#888;margin-top:4px;">'
+                f'WR similaire: {predictive.get("similar_win_rate", 0)}% vs Global: {predictive.get("global_win_rate", 0)}% | '
+                f'R:R similaire: {predictive.get("similar_avg_rr", 0)} | {conf_badge}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            # Top 3 setups similaires
+            top_similar = predictive.get("top_similar", [])
+            if top_similar:
+                st.caption("**Setups passés les plus similaires :**")
+                for ts in top_similar:
+                    outcome_icon = "✅" if ts["win"] else "❌"
+                    dir_icon = "🟢" if ts["direction"] == "long" else "🔴"
+                    sim_pct = f"{ts['similarity_score']:.0%}"
+                    st.caption(
+                        f"  {outcome_icon} {dir_icon} {ts['killzone_active']} | "
+                        f"{ts['macro_bias']} | Similarité: {sim_pct}"
+                    )
 
     with col_track_active:
         st.markdown("#### 🔄 Setups Actifs")

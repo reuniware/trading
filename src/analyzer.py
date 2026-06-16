@@ -122,10 +122,55 @@ class ICTAnalyzer:
             sweep_signals=sweep_signals,
         )
 
-        # Enregistrer les setups dans le tracker
+        # Enregistrer les setups dans le tracker avec contexte complet
         if price_val > 0 and (signals or proximity_setups):
-            self.setup_tracker.log_setups(signals, price_val, symbol=symbol, source="signal")
-            self.setup_tracker.log_setups(proximity_setups, price_val, symbol=symbol, source="proximity")
+            # Construire le contexte de marché
+            import json
+            now_dt = datetime.now()
+
+            # Killzone active
+            kz_active = ""
+            for s in session_stats.get("active_sessions", []):
+                if s.active:
+                    kz_active = s.label
+                    break
+
+            # Macro bias et zone de prix
+            macro = self.sessions.compute_macro_context(bias_map, proximity, session_stats)
+
+            # Concepts de proximité (compter par type)
+            concept_counts = {}
+            for ctype, alerts in proximity.items():
+                concept_counts[ctype] = len(alerts)
+            concepts_json = json.dumps(concept_counts) if concept_counts else ""
+
+            # Score de conformité killzone
+            kz_conf_score = 0.0
+            if killzone_conformity and hasattr(killzone_conformity, 'conformity_score'):
+                kz_conf_score = killzone_conformity.conformity_score
+
+            context = {
+                "killzone_active": kz_active,
+                "macro_bias": macro.get("macro_bias", ""),
+                "price_zone": macro.get("price_zone", ""),
+                "pd_array_range": pd_range,
+                "killzone_conformity_score": kz_conf_score,
+                "nb_tfs_bullish": sum(1 for b in bias_map.values() if b == "bullish"),
+                "nb_tfs_bearish": sum(1 for b in bias_map.values() if b == "bearish"),
+                "nb_tfs_neutral": sum(1 for b in bias_map.values() if b == "neutral"),
+                "nb_tfs_total": len(bias_map),
+                "day_of_week": now_dt.weekday(),
+                "hour_of_day": now_dt.hour,
+                "sweep_present": len(sweep_signals) > 0,
+                "proximity_concepts_json": concepts_json,
+            }
+
+            self.setup_tracker.log_setups(
+                signals, price_val, symbol=symbol, source="signal", context=context,
+            )
+            self.setup_tracker.log_setups(
+                proximity_setups, price_val, symbol=symbol, source="proximity", context=context,
+            )
 
             # Vérifier les setups existants
             high_val = latest_price.get("ask", price_val) if latest_price else price_val
@@ -134,6 +179,17 @@ class ICTAnalyzer:
 
         # 8. Compte
         account_stats = self.account.get_account_stats()
+
+        # Score prédictif basé sur l'historique similaire
+        predictive = {}
+        if price_val > 0 and (signals or proximity_setups):
+            # Utiliser le premier signal ou setup pour la prédiction
+            first_direction = "long"
+            if signals:
+                first_direction = "long" if signals[0].direction == "buy" else "short"
+            elif proximity_setups:
+                first_direction = proximity_setups[0].direction
+            predictive = self.setup_tracker.get_predictive_score(context, first_direction)
 
         return {
             "symbol": symbol,
@@ -153,6 +209,7 @@ class ICTAnalyzer:
             "setup_tracker_stats": self.setup_tracker.get_stats(),
             "setup_tracker_active": self.setup_tracker.get_active(),
             "killzone_conformity": killzone_conformity,
+            "predictive_score": predictive,
             "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current, active_tfs),
         }
 
