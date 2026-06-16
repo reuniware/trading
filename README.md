@@ -85,8 +85,13 @@ trading/
 ### 🗂️ Suivi des Setups (Setup Tracker)
 - **Tracking automatique** — chaque setup détecté est loggé avec entrée/SL/TP
 - **Vérification continue** — TP1/TP2/TP3 touché ou SL = résultat enregistré
-- **Stats en direct** — Win rate, R:R moyen, par direction LONG/SHORT, par source (signal/proximity)
-- **Progrès vers TP** — affichage du % de progression par setup actif
+- **Anti-résolution instantanée** — délai minimum de 60s avant qu'un setup puisse être résolu (évite les losses sur le même tick de création)
+- **Vrais High/Low OHLC** — la vérification utilise les bougies M1/M5/M15 au lieu des ticks bid/ask instantanés
+- **Dédoublonnage robuste** — correction du bug d'indentation qui empêchait la détection des doublons
+- **Stats en direct** — Win rate, R:R moyen, par direction LONG/SHORT (cartes métriques séparées), par source (signal/proximity)
+- **Âge & Expiration** — chaque setup affiche son temps de vie (Âge) et le temps restant avant expiration (7j max)
+- **Code couleur** — vert (> 50% temps restant), orange (25-50%), rouge (< 25%) sur la colonne Progrès
+- **R:R affiché** — ratio risque/récompense visible dans le tableau des setups actifs
 - **Persistance JSON** — les setups survivent aux redémarrages
 
 ### 🔫 Conformité Killzone
@@ -118,14 +123,15 @@ trading/
 - Performance 30 jours + Totale
 - Courbe d'equity
 - Matrice des biases multi-TF
-- **⏱️ Timeframes sélectionnables** : cases à cocher dans la sidebar pour filtrer les TFs analysés
+- **⏱️ Timeframes sélectionnables** : cases à cocher dans la sidebar pour filtrer les TFs analysés — **persistance via URL** (survit au F5)
 - **🕐 Sessions et Silver Bullet** : badges avec décomptes ouverture/fermeture, animation pulse orange
 - **📊 Bannière Macro ICT** : contexte global (Haussière/Baissière/Neutre) + zone de prix + killzone active + conformité killzone
 - **📍 Proximité ICT** : tableau DataFrame structuré (Concept, TF, Direction, Zone, Distance, Force)
 - **🎯 Setups de trading** : tableau DataFrame complet (Direction, Force, R:R, TFs, Entrée, SL, TP1-3, Raisons)
-- **📊 Suivi des Setups** : stats globales (win rate, R:R), par direction, par source, progrès TP en temps réel
+- **📊 Suivi des Setups** : stats globales (win rate, R:R), **cartes LONG/SHORT séparées** avec win rate coloré, par source, tableau des actifs avec Âge, Progrès (code couleur), R:R et Expire
 - **🔫 Conformité Killzone** : comportement attendu vs observé, score, alertes
 - **📖 Guide ICT intégré** : expandeur avec explications des killzones et macro, **toutes** les killzones actives surlignées
+- **🔄 Réinitialisation automatique** : changer les timeframes réinitialise tout (cache, tracker, historique JSON, analyseur)
 
 ---
 

@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 
 import sys
 sys.path.insert(0, '.')
+import shutil
 from src.config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS, TIMEFRAME_BARS, TIMEFRAME_NAMES
 from src.mt5_connector import MT5Connector
 from src.data_engine import DataEngine
@@ -140,7 +141,18 @@ def init_state():
     if "last_refresh" not in st.session_state:
         st.session_state.last_refresh = time.time()
     if "active_tfs" not in st.session_state:
-        st.session_state.active_tfs = list(TIMEFRAME_NAMES)
+        # Restaurer depuis les query params (survit au F5)
+        params = st.query_params
+        if "tfs" in params and params["tfs"]:
+            saved_tfs = params["tfs"].split(",")
+            # Filtrer pour ne garder que les TF valides
+            saved_tfs = [tf for tf in saved_tfs if tf in TIMEFRAME_NAMES]
+            if saved_tfs:
+                st.session_state.active_tfs = saved_tfs
+            else:
+                st.session_state.active_tfs = list(TIMEFRAME_NAMES)
+        else:
+            st.session_state.active_tfs = list(TIMEFRAME_NAMES)
 
 
 CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥", "CHF": "CHF", "CAD": "C$", "AUD": "A$"}
@@ -475,7 +487,19 @@ def render_dashboard():
 
         if selected_tfs != st.session_state.active_tfs:
             st.session_state.active_tfs = selected_tfs
+            # Sauvegarder dans les query params pour survie au F5
+            st.query_params["tfs"] = ",".join(selected_tfs)
             st.session_state.data_engine.clear_cache()
+            # Réinitialiser l'analyseur et le tracker (historique des setups, cache, etc.)
+            try:
+                if os.path.exists("mt5-reports/setup_tracker.json"):
+                    os.remove("mt5-reports/setup_tracker.json")
+                if os.path.exists("mt5-reports"):
+                    shutil.rmtree("mt5-reports")
+            except Exception:
+                pass
+            st.session_state.analyzer = ICTAnalyzer()
+            st.session_state.last_refresh = 0  # Force un refresh complet
             st.rerun()
 
         st.caption(f"{len(selected_tfs)}/{len(TIMEFRAME_NAMES)} actifs")
@@ -997,14 +1021,39 @@ def render_dashboard():
         with cols2[1]:
             render_metric("❌ Losses", str(losses), "negative")
 
-        # Par direction
+        # Par direction — métriques séparées LONG / SHORT
         long_data = tracker_stats.get("long", {})
         short_data = tracker_stats.get("short", {})
         if long_data or short_data:
-            st.caption(
-                f"🟢 LONG: {long_data.get('wins', 0)}W / {long_data.get('losses', 0)}L | "
-                f"🔴 SHORT: {short_data.get('wins', 0)}W / {short_data.get('losses', 0)}L"
-            )
+            st.markdown("**Par direction :**")
+            lw = long_data.get('wins', 0)
+            ll = long_data.get('losses', 0)
+            sw = short_data.get('wins', 0)
+            sl = short_data.get('losses', 0)
+            lwr = round(lw / (lw + ll) * 100, 1) if (lw + ll) > 0 else 0
+            swr = round(sw / (sw + sl) * 100, 1) if (sw + sl) > 0 else 0
+
+            dcols = st.columns(2)
+            with dcols[0]:
+                st.markdown(
+                    f'<div class="metric-card" style="border-color:#00ff88;">'
+                    f'<div class="label">🟢 LONG</div>'
+                    f'<div class="value positive">{lw}W / {ll}L</div>'
+                    f'<div style="font-size:0.9rem;color:#888;margin-top:2px;">'
+                    f'Win Rate: <span style="color:{"#00ff88" if lwr >= 50 else "#ffaa00" if lwr >= 30 else "#ff4444"};">{lwr}%</span>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with dcols[1]:
+                st.markdown(
+                    f'<div class="metric-card" style="border-color:#ff4444;">'
+                    f'<div class="label">🔴 SHORT</div>'
+                    f'<div class="value negative">{sw}W / {sl}L</div>'
+                    f'<div style="font-size:0.9rem;color:#888;margin-top:2px;">'
+                    f'Win Rate: <span style="color:{"#00ff88" if swr >= 50 else "#ffaa00" if swr >= 30 else "#ff4444"};">{swr}%</span>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
 
         # Par source
         by_source = tracker_stats.get("by_source", {})
@@ -1054,21 +1103,39 @@ def render_dashboard():
     with col_track_active:
         st.markdown("#### 🔄 Setups Actifs")
         if tracker_active:
+            EXPIRY_HOURS = 168  # 7 jours
+            now_dt = datetime.now()
             active_rows = []
             for ts in tracker_active[:10]:
                 entry = ts.entry_mid
                 direction_label = ts.get_direction_label()
-                distance = (analysis.get("current_price", {}).get("bid", 0) or 0) - entry
-                dist_pct = abs(distance) / max(entry, 1) * 100
 
-                # Progrès vers TP (approximation)
-                progress = 0.0
-                if ts.direction == "long" and ts.target_1 > entry and ts.target_1 != entry:
-                    current = analysis.get("current_price", {}).get("bid", 0) or 0
-                    progress = max(0, min((current - entry) / (ts.target_1 - entry) * 100, 100))
-                elif ts.direction == "short" and ts.target_1 < entry and ts.target_1 != entry:
-                    current = analysis.get("current_price", {}).get("bid", 0) or 0
-                    progress = max(0, min((entry - current) / (entry - ts.target_1) * 100, 100))
+                # ── Temps de vie écoulé ──
+                detected_dt = datetime.fromisoformat(ts.detected_at) if ts.detected_at else now_dt
+                hours_lived = (now_dt - detected_dt).total_seconds() / 3600
+                hours_remaining = max(0, EXPIRY_HOURS - hours_lived)
+                time_pct = round(min(hours_lived / EXPIRY_HOURS * 100, 100), 0)
+
+                # Format lisible
+                if hours_lived < 1:
+                    age_str = f"{int(hours_lived * 60)}min"
+                elif hours_lived < 24:
+                    age_str = f"{int(hours_lived)}h {int(hours_lived % 1 * 60)}m"
+                else:
+                    days = int(hours_lived / 24)
+                    h = int(hours_lived % 24)
+                    age_str = f"{days}j {h}h"
+
+                # Time remaining for display
+                if hours_remaining < 1:
+                    expiry_str = f"< 1min"
+                elif hours_remaining < 24:
+                    expiry_str = f"{int(hours_remaining)}h"
+                else:
+                    expiry_str = f"{int(hours_remaining / 24)}j"
+
+                # ── R:R du setup ──
+                rr_val = ts.risk_reward()
 
                 active_rows.append({
                     "ID": ts.id,
@@ -1076,15 +1143,32 @@ def render_dashboard():
                     "Entrée": f"{ts.entry_mid:.1f}",
                     "SL": f"{ts.stop_loss:.1f}",
                     "TP1": f"{ts.target_1:.1f}",
+                    "R:R": f"1:{rr_val:.1f}" if rr_val >= 1.0 else f"1:{rr_val:.2f}",
                     "Force": f"{ts.strength:.0%}",
-                    "Progrès": f"{progress:.0f}%",
-                    "Détecté": ts.detected_at[:16] if ts.detected_at else "N/A",
+                    "Âge": age_str,
+                    "Progrès": f"{time_pct:.0f}%",  # String formaté pour affichage
+                    "_prog_pct": time_pct,             # Valeur numérique cachée pour le code couleur
+                    "Expire": expiry_str,
+                    "Détecté": ts.detected_at[:16] if ts.detected_at else "",
                 })
 
             if active_rows:
                 df_active = pd.DataFrame(active_rows)
+
+                # Code couleur sur _prog_pct : vert > 50% restant, orange 25-50%, rouge < 25%
+                def _color_progress(v):
+                    remaining = 100 - v  # % de temps restant avant expiration
+                    if remaining > 50:
+                        return 'color: #00ff88; font-weight: bold'
+                    elif remaining > 25:
+                        return 'color: #ffaa00; font-weight: bold'
+                    else:
+                        return 'color: #ff4444; font-weight: bold'
+
+                styled = df_active.style.map(_color_progress, subset=['_prog_pct'])
+
                 st.dataframe(
-                    df_active,
+                    styled,
                     use_container_width=True,
                     hide_index=True,
                     column_config={
@@ -1093,8 +1177,15 @@ def render_dashboard():
                         "Entrée": st.column_config.TextColumn("💰 Entrée", width="small"),
                         "SL": st.column_config.TextColumn("🛑 SL", width="small"),
                         "TP1": st.column_config.TextColumn("TP1", width="small"),
+                        "R:R": st.column_config.TextColumn("📊 R:R", width="small"),
                         "Force": st.column_config.TextColumn("💪 Force", width="small"),
-                        "Progrès": st.column_config.TextColumn("📈 Progrès", width="small"),
+                        "Âge": st.column_config.TextColumn("⏱️ Âge", width="small"),
+                        "Progrès": st.column_config.TextColumn(
+                            "⌛ Expire",
+                            help="% du temps d'expiration écoulé (168h max). Vert = récent, Orange = moyen, Rouge = expire bientôt",
+                        ),
+                        "_prog_pct": st.column_config.Column(" ", width="0"),  # Caché (largeur nulle)
+                        "Expire": st.column_config.TextColumn("⏰ Restant", width="small"),
                         "Détecté": st.column_config.TextColumn("🕐 Détecté", width="medium"),
                     },
                 )

@@ -244,29 +244,35 @@ class SetupTracker:
         elif direction == 'sell':
             direction = 'short'
 
-        for setup in self.setups.values():
-            if setup.status != "active":
-                continue
-            if setup.direction != direction:
-                continue
-            # Même direction et prix d'entrée proche (< 1% d'écart) = doublon
-        # Calculer le prix d'entrée moyen selon le type de setup
+        # Calculer le prix d'entrée moyen du nouveau setup
         if hasattr(new_setup, 'entry_mid'):
             entry_new = new_setup.entry_mid
         elif hasattr(new_setup, 'entry_zone_low'):
             entry_new = (new_setup.entry_zone_low + new_setup.entry_zone_high) / 2
         else:
             entry_new = current_price
+
+        now = datetime.now()
+        for setup in self.setups.values():
+            if setup.status != "active":
+                continue
+            if setup.direction != direction:
+                continue
+            # Même direction et prix d'entrée proche (< 1% d'écart) = doublon
             if abs(setup.entry_mid - entry_new) / max(setup.entry_mid, 1) < 0.01:
-                detected_at = datetime.fromisoformat(setup.detected_at) if setup.detected_at else datetime.now()
-                if (datetime.now() - detected_at).total_seconds() < 3600:  # Moins d'1h
+                detected_at = datetime.fromisoformat(setup.detected_at) if setup.detected_at else now
+                if (now - detected_at).total_seconds() < 3600:  # Moins d'1h
                     return True
         return False
 
-    def check_all(self, current_price: float, current_high: float, current_low: float) -> Dict[str, int]:
+    def check_all(self, current_price: float, current_high: float, current_low: float, min_age_seconds: int = 0) -> Dict[str, int]:
         """
         Vérifie tous les setups actifs contre le prix actuel.
         Met à jour les statuts si TP ou SL touché.
+        
+        Args:
+            min_age_seconds: Âge minimum en secondes avant qu'un setup puisse être résolu.
+                             Évite les résolutions instantanées sur le même tick de création.
         Retourne le compte des changements.
         """
         changes = {"tp1": 0, "tp2": 0, "tp3": 0, "sl": 0, "expired": 0}
@@ -288,6 +294,12 @@ class SetupTracker:
                 setup.outcome_at = now.isoformat()
                 changes["expired"] += 1
                 continue
+
+            # Anti-résolution instantanée : ne pas résoudre les setups trop récents
+            if min_age_seconds > 0:
+                age_seconds = (now - detected_at).total_seconds()
+                if age_seconds < min_age_seconds:
+                    continue
 
             # Vérifier TP/SL
             outcome = setup.check_outcome(current_price, current_high, current_low)

@@ -172,10 +172,17 @@ class ICTAnalyzer:
                 proximity_setups, price_val, symbol=symbol, source="proximity", context=context,
             )
 
-            # Vérifier les setups existants
-            high_val = latest_price.get("ask", price_val) if latest_price else price_val
-            low_val = latest_price.get("bid", price_val) if latest_price else price_val
-            self.setup_tracker.check_all(price_val, high_val, low_val)
+            # Vérifier les setups existants avec les vrais High/Low OHLC (évite les résolutions sur ticks bid/ask)
+            current_high = price_val
+            current_low = price_val
+            # Utiliser la bougie M1/M5 la plus récente pour le high/low réel
+            for tf_check in ["M1", "M5", "M15"]:
+                if tf_check in data and data[tf_check] is not None and len(data[tf_check]) > 0:
+                    last_bar = data[tf_check].iloc[-1]
+                    current_high = float(last_bar["high"])
+                    current_low = float(last_bar["low"])
+                    break
+            self.setup_tracker.check_all(price_val, current_high, current_low, min_age_seconds=60)
 
         # 8. Compte
         account_stats = self.account.get_account_stats()
