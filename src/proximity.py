@@ -14,7 +14,7 @@ from datetime import datetime
 from .config import TIMEFRAME_LABELS
 from .ict_concepts import (
     OrderBlock, FairValueGap, MarketStructureShift,
-    LiquidityLevel, DiscountPremium, PriceGap,
+    LiquidityLevel, DiscountPremium, PriceGap, KeyLevel, SweepSignal,
 )
 
 logger = logging.getLogger("Proximity")
@@ -112,6 +112,8 @@ class PriceProximityAnalyzer:
         self,
         current_price: float,
         analysis: Dict[str, dict],
+        key_levels: Optional[List[KeyLevel]] = None,
+        sweep_signals: Optional[List[SweepSignal]] = None,
     ) -> Dict[str, List[ProximityAlert]]:
         """
         Analyse complète de proximité sur tous les timeframes.
@@ -179,6 +181,13 @@ class PriceProximityAnalyzer:
             "BSL": [],
             "SSL": [],
             "MSS": [],
+            "SWEEP": [],
+            "PDH": [],
+            "PDL": [],
+            "PWH": [],
+            "PWL": [],
+            "PMH": [],
+            "PML": [],
         }
         for a in alerts:
             if a.concept_type in grouped:
@@ -186,7 +195,83 @@ class PriceProximityAnalyzer:
                     grouped[a.concept_type].append(a)
 
         # Nettoyer les listes vides
-        return {k: v for k, v in grouped.items() if v}
+        result = {k: v for k, v in grouped.items() if v}
+
+        # Ajouter les key levels comme alertes de proximité
+        if key_levels:
+            result = self._add_key_level_alerts(result, key_levels, current_price, max_dist)
+
+        # Ajouter les sweep signals comme alertes
+        if sweep_signals:
+            result = self._add_sweep_alerts(result, sweep_signals, current_price)
+
+        return result
+
+    def _add_key_level_alerts(
+        self, grouped: Dict, key_levels: List[KeyLevel],
+        current_price: float, max_dist: float,
+    ) -> Dict:
+        """Ajoute les key levels (PDH, PDL, etc.) aux alertes de proximité."""
+        for kl in key_levels:
+            dist = current_price - kl.level
+            abs_dist = abs(dist)
+            if abs_dist > max_dist * 3:
+                continue
+
+            inside = abs_dist < self.pd_range * 0.02
+            direction = "bearish" if kl.liquidity_type == "BSL" else "bullish"
+            swept_str = f" — SWEEP {'🟢' if kl.swept else ''}" if kl.swept else ""
+
+            alert = ProximityAlert(
+                concept_type=kl.level_type,
+                tf=kl.source_tf,
+                direction=direction,
+                level_low=kl.level,
+                level_high=kl.level,
+                price_distance=0.0 if inside else dist,
+                distance_pct=self._dist_pct(abs_dist),
+                strength=kl.strength,
+                detail=f"{kl.level_type} ({kl.label}) à {kl.level:.1f} — Source: {kl.source_tf}{swept_str}",
+                is_entry_zone=inside,
+            )
+
+            if kl.level_type in grouped:
+                if len(grouped[kl.level_type]) < 2:
+                    grouped[kl.level_type].append(alert)
+            else:
+                grouped[kl.level_type] = [alert]
+
+        return grouped
+
+    def _add_sweep_alerts(
+        self, grouped: Dict, sweep_signals: List[SweepSignal],
+        current_price: float,
+    ) -> Dict:
+        """Ajoute les sweep signals comme alertes spéciales."""
+        for ss in sweep_signals:
+            if not ss.confirmation:
+                continue
+            direction = "bullish" if ss.direction == "buy" else "bearish"
+            concept_type = "SWEEP"
+
+            alert = ProximityAlert(
+                concept_type=concept_type,
+                tf=ss.level.source_tf,
+                direction=direction,
+                level_low=ss.level.level,
+                level_high=ss.level.level,
+                price_distance=current_price - ss.level.level,
+                distance_pct=self._dist_pct(abs(current_price - ss.level.level)),
+                strength=ss.strength * 1.2,
+                detail=ss.detail,
+                is_entry_zone=True,
+            )
+
+            if "SWEEP" not in grouped:
+                grouped["SWEEP"] = []
+            grouped["SWEEP"].append(alert)
+
+        return grouped
 
     def _dist_pct(self, distance: float) -> float:
         """Distance en % du PD Array range."""
@@ -460,6 +545,8 @@ class PriceProximityAnalyzer:
         alerts: Dict[str, List[ProximityAlert]],
         analysis: Dict[str, dict],
         current_price: float,
+        key_levels: Optional[List[KeyLevel]] = None,
+        sweep_signals: Optional[List[SweepSignal]] = None,
     ) -> List[ProximitySetup]:
         """
         Génère des setups Long/Short avec SL et TP à partir des proximités.
@@ -472,6 +559,15 @@ class PriceProximityAnalyzer:
             return []
 
         setups: List[ProximitySetup] = []
+
+        # D'abord, générer les setups basés sur les sweeps de key levels (prioritaires)
+        if sweep_signals:
+            for ss in sweep_signals:
+                if not ss.confirmation:
+                    continue
+                setup = self._build_sweep_setup(ss, alerts, analysis, current_price)
+                if setup:
+                    setups.append(setup)
 
         # Collecter le bias par TF pour confirmer la direction
         bias_long_tfs = 0
@@ -497,9 +593,18 @@ class PriceProximityAnalyzer:
             setups.append(setup_long)
 
         # --- SETUP SHORT ---
-        setup_short = self._build_short_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs)
+        setup_short = self._build_short_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs, key_levels)
         if setup_short:
             setups.append(setup_short)
+
+        # --- SETUPS BASÉS SUR LES KEY LEVELS ---
+        if key_levels:
+            kl_long = self._build_keylevel_setup("long", alerts, analysis, current_price, key_levels, bias_long_tfs, bias_short_tfs)
+            if kl_long:
+                setups.append(kl_long)
+            kl_short = self._build_keylevel_setup("short", alerts, analysis, current_price, key_levels, bias_long_tfs, bias_short_tfs)
+            if kl_short:
+                setups.append(kl_short)
 
         setups.sort(key=lambda s: s.strength, reverse=True)
         return setups
@@ -510,6 +615,7 @@ class PriceProximityAnalyzer:
         price: float,
         bias_long: int,
         bias_short: int,
+        key_levels: Optional[List[KeyLevel]] = None,
     ) -> Optional[ProximitySetup]:
         """Construit un setup LONG si les conditions sont réunies."""
         # Conditions pour LONG :
@@ -672,6 +778,7 @@ class PriceProximityAnalyzer:
         price: float,
         bias_long: int,
         bias_short: int,
+        key_levels: Optional[List[KeyLevel]] = None,
     ) -> Optional[ProximitySetup]:
         """Construit un setup SHORT si les conditions sont réunies."""
         has_premium = "Premium" in alerts and any(a.is_entry_zone for a in alerts["Premium"])
@@ -811,6 +918,151 @@ class PriceProximityAnalyzer:
             tfs=list(tfs_used),
         )
 
+    # ─── Setup basé sur un sweep de key level ──────────────────────────
+
+    def _build_sweep_setup(
+        self, ss: SweepSignal,
+        alerts: Dict[str, List[ProximityAlert]],
+        analysis: Dict[str, dict],
+        current_price: float,
+    ) -> Optional[ProximitySetup]:
+        """
+        Construit un setup à partir d'un sweep de key level (Judas Swing/Turtle Soup).
+        Setup très puissant car le sweep indique une manipulation institutionnelle.
+        """
+        direction = ss.direction  # "buy" ou "sell"
+        level_price = ss.level.level
+
+        if direction == "buy":
+            # Sweep SSL → LONG : entrée au-dessus du niveau, SL sous le low récent
+            entry_low = level_price + self.pd_range * 0.05
+            entry_high = level_price + self.pd_range * 0.15
+            sl_price = level_price - self.pd_range * 0.3
+            tp1 = current_price + self.pd_range * 1.272
+            tp2 = current_price + self.pd_range * 1.618
+            tp3 = current_price + self.pd_range * 2.0
+
+            entry_reason = f"Sweep SSL du {ss.level.level_type} ({ss.level.label}) à {level_price:.1f}$ — prix remonté → LONG"
+            sl_reason = f"SL sous le {ss.level.level_type} sweepé ({level_price:.1f}$) + buffer {self.pd_range * 0.3:.1f}$"
+            tp_reason = f"Extension Fibonacci 1.272× PD range vers le haut ({self.pd_range:.1f}$)"
+            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal LONG à haute probabilité"
+        else:
+            # Sweep BSL → SHORT : entrée sous le niveau, SL au-dessus du high récent
+            entry_low = level_price - self.pd_range * 0.15
+            entry_high = level_price - self.pd_range * 0.05
+            sl_price = level_price + self.pd_range * 0.3
+            tp1 = current_price - self.pd_range * 1.272
+            tp2 = current_price - self.pd_range * 1.618
+            tp3 = current_price - self.pd_range * 2.0
+
+            entry_reason = f"Sweep BSL du {ss.level.level_type} ({ss.level.label}) à {level_price:.1f}$ — prix redescendu → SHORT"
+            sl_reason = f"SL au-dessus du {ss.level.level_type} sweepé ({level_price:.1f}$) + buffer {self.pd_range * 0.3:.1f}$"
+            tp_reason = f"Extension Fibonacci 1.272× PD range vers le bas ({self.pd_range:.1f}$)"
+            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal SHORT à haute probabilité"
+
+        return ProximitySetup(
+            direction=direction,
+            entry_low=round(entry_low, 1),
+            entry_high=round(entry_high, 1),
+            stop_loss=round(sl_price, 1),
+            target_1=round(tp1, 1),
+            target_2=round(tp2, 1),
+            target_3=round(tp3, 1),
+            strength=min(ss.strength + 0.2, 1.0),
+            reason=reason,
+            entry_reason=entry_reason,
+            sl_reason=sl_reason,
+            tp_reason=tp_reason,
+            concepts=[f"SWEEP_{ss.level.level_type}"],
+            tfs=[ss.level.source_tf],
+        )
+
+    # ─── Setup basé sur les key levels (proximité) ────────────────────
+
+    def _build_keylevel_setup(
+        self, direction: str,
+        alerts: Dict[str, List[ProximityAlert]],
+        analysis: Dict[str, dict],
+        price: float,
+        key_levels: List[KeyLevel],
+        bias_long: int,
+        bias_short: int,
+    ) -> Optional[ProximitySetup]:
+        """
+        Construit un setup basé sur la proximité avec un key level non sweepé.
+        Le prix a tendance à être attiré vers ces niveaux.
+        """
+        if direction == "long":
+            # Chercher un PDL/PWL/PML non sweepé au-dessus du prix
+            # → le prix va chercher cette SSL (target baissier puis rebond = LONG)
+            targets = [kl for kl in key_levels
+                       if kl.liquidity_type == "SSL" and not kl.swept and kl.level < price]
+            if not targets:
+                return None
+
+            # Prendre le plus proche
+            target = max(targets, key=lambda k: k.level)
+            if abs(price - target.level) > self.pd_range * 5:
+                return None
+
+            entry_low = price - self.pd_range * 0.05
+            entry_high = price + self.pd_range * 0.05
+            sl_price = target.level - self.pd_range * 0.2
+            tp1 = price + self.pd_range * 1.272
+            tp2 = price + self.pd_range * 1.618
+            tp3 = None
+
+            return ProximitySetup(
+                direction="long",
+                entry_low=round(entry_low, 1),
+                entry_high=round(entry_high, 1),
+                stop_loss=round(sl_price, 1),
+                target_1=round(tp1, 1),
+                target_2=round(tp2, 1),
+                target_3=tp3,
+                strength=0.65,
+                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — zone de SSL attractive",
+                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$)",
+                sl_reason=f"SL sous le {target.level_type} ({target.level:.1f}$) + buffer",
+                tp_reason=f"Extension Fibonacci 1.272× PD range ({self.pd_range:.1f}$)",
+                concepts=[target.level_type],
+                tfs=[target.source_tf],
+            )
+        else:
+            # Chercher un PDH/PWH/PMH non sweepé au-dessus du prix
+            targets = [kl for kl in key_levels
+                       if kl.liquidity_type == "BSL" and not kl.swept and kl.level > price]
+            if not targets:
+                return None
+
+            target = min(targets, key=lambda k: k.level)
+            if abs(price - target.level) > self.pd_range * 5:
+                return None
+
+            entry_low = price - self.pd_range * 0.05
+            entry_high = price + self.pd_range * 0.05
+            sl_price = target.level + self.pd_range * 0.2
+            tp1 = price - self.pd_range * 1.272
+            tp2 = price - self.pd_range * 1.618
+            tp3 = None
+
+            return ProximitySetup(
+                direction="short",
+                entry_low=round(entry_low, 1),
+                entry_high=round(entry_high, 1),
+                stop_loss=round(sl_price, 1),
+                target_1=round(tp1, 1),
+                target_2=round(tp2, 1),
+                target_3=tp3,
+                strength=0.65,
+                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — zone de BSL attractive",
+                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$)",
+                sl_reason=f"SL au-dessus du {target.level_type} ({target.level:.1f}$) + buffer",
+                tp_reason=f"Extension Fibonacci 1.272× PD range ({self.pd_range:.1f}$)",
+                concepts=[target.level_type],
+                tfs=[target.source_tf],
+            )
+
     # ─── Résumé formaté ────────────────────────────────────────────────────
 
     def get_summary(self, alerts: Dict[str, List[ProximityAlert]]) -> str:
@@ -820,10 +1072,11 @@ class PriceProximityAnalyzer:
 
         lines = ["📍 PROXIMITÉS ICT", "=" * 55]
 
-        order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
+        order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS", "PDH", "PDL", "PWH", "PWL", "PMH", "PML"]
         icons = {
             "OB": "🧱", "FVG": "🕳️", "GAP": "〰️", "OTE": "🎯", "Discount": "🟢",
-            "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥"
+            "Premium": "🔴", "Equilibrium": "⚖️", "BSL": "⬆️", "SSL": "⬇️", "MSS": "💥",
+            "PDH": "📈", "PDL": "📉", "PWH": "📈", "PWL": "📉", "PMH": "🏔️", "PML": "🏔️",
         }
 
         for concept_type in order:

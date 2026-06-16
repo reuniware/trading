@@ -133,6 +133,54 @@ def cmd_scan(args):
     if analysis["sessions"].get("silver_bullet_active"):
         print("  🔥 Silver Bullet NY active !")
 
+    # Key Levels (PDH, PDL, PWH, PWL, PMH, PML)
+    key_levels = analysis.get("key_levels", [])
+    if key_levels:
+        print()
+        print("🔑 NIVEAUX CLÉS (Key Levels)")
+        print("-" * 55)
+        order_kl = ["PMH", "PML", "PWH", "PWL", "PDH", "PDL"]
+        kl_labels = {
+            "PMH": "Plus Haut Mois Précédent", "PML": "Plus Bas Mois Précédent",
+            "PWH": "Plus Haut Semaine Précédente", "PWL": "Plus Bas Semaine Précédente",
+            "PDH": "Plus Haut Jour Précédent", "PDL": "Plus Bas Jour Précédent",
+        }
+        for lt in order_kl:
+            for kl in key_levels:
+                if kl.level_type == lt:
+                    swept_str = " 🔥 SWEEPÉ" if kl.swept else ""
+                    dist = current["bid"] - kl.level if current.get("bid") else 0
+                    print(f"  {'⬆️' if kl.liquidity_type == 'BSL' else '⬇️'} {kl.level_type}: {kl.level:.1f}$ "
+                          f"({kl_labels.get(lt, lt)}) — {dist:+.1f}$ du prix{swept_str}")
+
+    # Sweep signals
+    sweeps = analysis.get("sweep_signals", [])
+    if sweeps:
+        print()
+        print("🔥 SIGNAUX DE SWEEP (Judas Swing / Turtle Soup)")
+        print("-" * 55)
+        for ss in sweeps:
+            direction = "🟢 LONG" if ss.direction == "buy" else "🔴 SHORT"
+            print(f"  {direction} | {ss.detail[:100]}")
+
+    # Conformité Killzone
+    killzone_conf = analysis.get("killzone_conformity")
+    if killzone_conf and killzone_conf.is_active:
+        print()
+        print("🔫 CONFORMITÉ KILLZONE")
+        print("-" * 55)
+        conf_label = killzone_conf.conformity_label()
+        score_pct = f"{killzone_conf.conformity_score:.0%}"
+        print(f"  Killzone active: {killzone_conf.killzone_label}")
+        print(f"  Conformité: {conf_label} ({score_pct})")
+        print(f"  Attendu: {killzone_conf.expected_behavior}")
+        print(f"  Observé: {killzone_conf.actual_behavior}")
+        print(f"  Détails:")
+        for detail in killzone_conf.details:
+            print(f"    {detail}")
+        if killzone_conf.warning:
+            print(f"\n  ⚠️  {killzone_conf.warning}")
+
     # Proximité ICT
     print()
     print("📍 PROXIMITÉS ICT")
@@ -179,6 +227,33 @@ def cmd_scan(args):
             print(f"    ├─ TP1:    {s.target_1:.1f}{tp2_str}{tp3_str}")
             print(f"    │  {s.tp_reason}")
             print(f"    └─ {s.reason}")
+
+    # Suivi des setups (tracker)
+    tracker_stats = analysis.get("setup_tracker_stats", {})
+    tracker_active = analysis.get("setup_tracker_active", [])
+    if tracker_stats.get("total_tracked", 0) > 0:
+        print()
+        print("📊 SUIVI DES SETUPS")
+        print("-" * 55)
+        total = tracker_stats.get("total_tracked", 0)
+        active = tracker_stats.get("active", 0)
+        wins = tracker_stats.get("wins", 0)
+        losses = tracker_stats.get("losses", 0)
+        win_rate = tracker_stats.get("win_rate", 0)
+        avg_rr = tracker_stats.get("avg_rr_realized", 0)
+        print(f"  Total trackés: {total} | Actifs: {active} | Terminés: {wins + losses}")
+        print(f"  ✅ Wins: {wins} | ❌ Losses: {losses} | Win Rate: {win_rate}% | R:R moyen: {avg_rr}")
+
+        long_data = tracker_stats.get("long", {})
+        short_data = tracker_stats.get("short", {})
+        if long_data or short_data:
+            print(f"  🟢 LONG: {long_data.get('wins', 0)}W/{long_data.get('losses', 0)}L | 🔴 SHORT: {short_data.get('wins', 0)}W/{short_data.get('losses', 0)}L")
+
+        if tracker_active:
+            print(f"\n  🔄 Setups actifs ({len(tracker_active)}):")
+            for ts in tracker_active[:5]:
+                direction = ts.get_direction_label()
+                print(f"    ├─ #{ts.id} {direction} | Entrée: {ts.entry_mid:.1f} | SL: {ts.stop_loss:.1f} | TP1: {ts.target_1:.1f}")
 
     print()
 

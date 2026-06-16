@@ -9,11 +9,12 @@ Connecté à **MetaTrader 5** (compte FTMO) pour l'analyse multi-timeframes, la 
 
 - [Architecture](#-architecture-du-projet)
 - [Fonctionnalités](#-fonctionnalités)
-- [Installation](#-installation)
+- [Démarrage rapide](#-dmarrage-rapide)
 - [Utilisation](#-utilisation)
 - [Modules](#-modules)
 - [Concepts ICT détectés](#-concepts-ict-détectés)
 - [Résultats de performance](#-résultats-de-performance)
+- [Dépannage](#-dpannage)
 - [Dépendances](#-dépendances)
 - [Licence](#-licence)
 
@@ -32,10 +33,11 @@ trading/
 │   ├── config.py                    # Configuration centralisée
 │   ├── mt5_connector.py             # Connexion singleton MT5
 │   ├── data_engine.py               # Données OHLC multi-TF avec cache
-│   ├── ict_concepts.py              # Détection OB, FVG, MSS, Liquidité, PriceGap
-│   ├── sessions.py                  # Kill Zones (Asie/Londres/NY)
+│   ├── ict_concepts.py              # Détection OB, FVG, MSS, Liquidité, Key Levels, Sweeps
+│   ├── sessions.py                  # Kill Zones + Conformité prix/killzone
 │   ├── proximity.py                 # Proximité prix + setups trading LONG/SHORT
 │   ├── signal_generator.py          # Scoring et génération de signaux
+│   ├── setup_tracker.py             # Suivi des setups (TP/SL, win rate, persistance JSON)
 │   ├── trade_manager.py             # Exécution d'ordres MT5
 │   ├── risk_manager.py              # Position sizing et limites
 │   ├── account_monitor.py           # Stats compte et historique
@@ -67,8 +69,39 @@ trading/
 - **Fair Value Gaps (FVG)** — Gaps de prix à 3 bougies
 - **Market Structure Shift (MSS/BOS)** — Cassures de structure
 - **Buy-Side / Sell-Side Liquidity (BSL/SSL)** — Zones de liquidité
-- **Liquidity Sweeps** — Chasses de liquidité détectées
+- **Key Levels (PDH/PDL/PWH/PWL/PMH/PML)** — Niveaux clés jour/semaine/mois précédents
+- **Liquidity Sweeps (Judas Swing / Turtle Soup)** — Chasses de liquidité sur niveaux clés
 - **Discount / Premium Zones** — Zones d'achat/vente ICT
+
+### 🎯 Scoring des signaux (0-100)
+- **Bias alignment** : Cohérence multi-TF (max +50 pts)
+- **Concepts strength** : Force des OB/FVG/MSS par TF (max +30 pts)
+- **Sweep bonus** : +12 pts si sweep favorable, −5 pts si opposé
+- **Liquidity confluence** : Bonus pour plusieurs BSL/SSL proches
+- **Kill Zones bonus** : Session active / Silver Bullet (max +12 pts)
+- **Conflit TF malus** : Détection de conflits directionnels (−10 pts)
+- **Normalisation** : Score final entre 0 et 100
+
+### 🗂️ Suivi des Setups (Setup Tracker)
+- **Tracking automatique** — chaque setup détecté est loggé avec entrée/SL/TP
+- **Vérification continue** — TP1/TP2/TP3 touché ou SL = résultat enregistré
+- **Stats en direct** — Win rate, R:R moyen, par direction LONG/SHORT, par source (signal/proximity)
+- **Progrès vers TP** — affichage du % de progression par setup actif
+- **Persistance JSON** — les setups survivent aux redémarrages
+
+### 🔫 Conformité Killzone
+- **Vérification du comportement du prix** — le prix fait-il ce qu'il est censé faire dans la killzone ?
+- **Asie** → range étroit, consolidation, faible volume
+- **Londres** → trend directionnel, forte volatilité
+- **New York** → sweeps de liquidité, potentiel reversal
+- **Silver Bullet** → impulsion forte, expansion range
+- **Score de conformité 0-100%** avec badge ✅/⚠️/❌
+
+### 🔄 Auto-Redémarrage intelligent
+- **Survie aux erreurs de code transitoires** — si le dashboard crash après une modification live
+- **Message d'erreur affiché** + explication + traceback
+- **Redémarrage automatique** en 3 secondes (cleanup caches + kill PID + restart)
+- **Anti-boucle** — max 3 redémarrages en 60s, puis arrêt définitif avec message
 
 ### 🎯 Scoring des signaux (0-100)
 - **Bias alignment** : Cohérence multi-TF (max +50 pts)
@@ -86,85 +119,93 @@ trading/
 - Courbe d'equity
 - Matrice des biases multi-TF
 - **⏱️ Timeframes sélectionnables** : cases à cocher dans la sidebar pour filtrer les TFs analysés
-- **🕐 Sessions et Silver Bullet** : badges avec décomptes ouverture/fermeture
-- **📊 Bannière Macro ICT** : contexte global (Haussière/Baissière/Neutre) + zone de prix + killzone active + décompte
+- **🕐 Sessions et Silver Bullet** : badges avec décomptes ouverture/fermeture, animation pulse orange
+- **📊 Bannière Macro ICT** : contexte global (Haussière/Baissière/Neutre) + zone de prix + killzone active + conformité killzone
 - **📍 Proximité ICT** : tableau DataFrame structuré (Concept, TF, Direction, Zone, Distance, Force)
 - **🎯 Setups de trading** : tableau DataFrame complet (Direction, Force, R:R, TFs, Entrée, SL, TP1-3, Raisons)
-- **📖 Guide ICT intégré** : expandeur avec explications des killzones et macro, mise en évidence dynamique de la session active
+- **📊 Suivi des Setups** : stats globales (win rate, R:R), par direction, par source, progrès TP en temps réel
+- **🔫 Conformité Killzone** : comportement attendu vs observé, score, alertes
+- **📖 Guide ICT intégré** : expandeur avec explications des killzones et macro, **toutes** les killzones actives surlignées
 
 ---
 
-## 🚀 Installation
+## 🚀 Démarrage rapide
 
-### Prérequis
-- Python 3.10+
-- MetaTrader 5 (FTMO Global Markets Terminal)
+### 1. Prérequis
+- **Python 3.10+** installé
+- **MetaTrader 5 OUVERT et connecté** au compte FTMO — le terminal doit être lancé **avant** toute commande
 - Compte FTMO démo ou réel
 
-### Installation des dépendances
+### 2. Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Configuration
+### 3. Configuration
 Éditez `src/config.py` pour ajuster :
-- `SYMBOLS` — Symboles à trader
+- `SYMBOLS` — Symboles à trader (défaut : `XAUUSD`)
 - `RISK` — Paramètres de risque (max risk %, max positions, R:R)
 - `ICT` — Paramètres de détection ICT (lookback, ratios)
 
-Le path du terminal MT5 est configurable dans `src/mt5_connector.py` :
+Le chemin du terminal MT5 est configurable dans `src/mt5_connector.py` :
 ```python
 self.terminal_path = r"C:\Program Files\FTMO Global Markets MT5 Terminal\terminal64.exe"
 ```
+> ⚠️ Si vous utilisez un autre broker que FTMO, modifiez ce chemin.
+
+### 4. Lancer le système
+
+```bash
+# Étape 1 : Vérifier que MT5 est ouvert et connecté
+
+# Étape 2 : Scanner les signaux (one-shot, quitte après affichage)
+python main.py scan --symbol XAUUSD
+
+# Étape 3 : Lancer le dashboard (processus continu — ouvrez un terminal dédié)
+python main.py dashboard
+# Puis ouvrez http://localhost:8501 dans votre navigateur
+```
+
+> 💡 **Windows :** le plus simple est de double-cliquer sur `start_dashboard.bat` depuis l'Explorateur.
+> Il nettoie automatiquement les processus bloquants et les caches avant de lancer le dashboard.
+>
+> 💡 **Git Bash :** lancez le dashboard avec `python main.py dashboard &` pour le mettre en arrière-plan.
+> Sinon le terminal reste bloqué (c'est normal, Streamlit tourne en continu).
 
 ---
 
 ## 🎮 Utilisation
 
-### CLI (Console)
+### Commandes CLI
+
+| Commande | Description | Type |
+|----------|-------------|------|
+| `python main.py scan --symbol XAUUSD` | Scanner ICT complet (bias, signaux, proximité, setups) | One-shot |
+| `python main.py scan -t D1,H4,H1,M15` | Scanner avec timeframes filtrés | One-shot |
+| `python main.py analyze --symbol XAUUSD` | Générer un rapport `.md` complet | One-shot |
+| `python main.py dashboard` | Lancer le dashboard Streamlit | **Continu** 🔄 |
+| `python main.py positions` | Afficher les positions ouvertes | One-shot |
+| `python main.py account` | Infos compte (balance, equity, P&L) | One-shot |
+
+> 🔄 **Continu** = le processus ne s'arrête pas tout seul. Utilisez un terminal dédié ou `start_dashboard.bat`.
+
+### Dashboard Streamlit
 
 ```bash
-# Dashboard Streamlit (par défaut)
-python main.py
-
-# Scanner les signaux ICT en temps réel
-python main.py scan --symbol XAUUSD
-
-# Générer un rapport d'analyse complet (.md)
-python main.py analyze --symbol XAUUSD
-
-# Afficher les positions ouvertes
-python main.py positions
-
-# Informations du compte
-python main.py account
-```
-
-### Dashboard Streamlit (recommandé)
-
-```bash
-# Via main.py — NETTOIE les caches + tue les anciens processus automatiquement
-python main.py
-# ou explicitement :
+# Méthode recommandée — cleanup automatique (PID + caches) puis lancement
 python main.py dashboard
-```
 
-### Dashboard Streamlit (direct, sans cleanup)
-```bash
-# Lancement direct — PAS de nettoyage automatique
+# Alternative Windows : double-clic sur start_dashboard.bat
+
+# ⚠️ Déconseillé — pas de cleanup automatique
 streamlit run src/dashboard.py
 ```
 
-> ⚠️ **Important :** `streamlit run` ne nettoie pas les caches `.pyc`. Après une mise à jour du code, utilisez `python main.py dashboard` ou `start_dashboard.bat` pour éviter les erreurs `AttributeError` liées à un cache obsolète.
+Après le lancement, accédez au dashboard : **[http://localhost:8501](http://localhost:8501)**
 
-### Lanceur Windows (`start_dashboard.bat`)
-```bat
-# Double-clic sur start_dashboard.bat dans l'Explorateur
-# Effectue le cleanup (PID + cache) puis lance le dashboard
-```
-
-Accès : [http://localhost:8501](http://localhost:8501)
+> ⚠️ **Après une mise à jour du code**, utilisez `python main.py dashboard` ou `start_dashboard.bat`.
+> Le lancement direct via `streamlit run` ne nettoie pas les caches `.pyc` et peut causer des `AttributeError`.
 
 ---
 
@@ -198,14 +239,20 @@ Cœur du système — détection de tous les concepts ICT :
 - `FairValueGap` : gap distance et force
 - `MarketStructureShift` : MSS/BOS avec direction
 - `LiquidityLevel` : BSL/SSL avec sweep detection
+- `KeyLevel` : PDH/PDL (jour), PWH/PWL (semaine), PMH/PML (mois) — aimants à liquidité
+- `SweepSignal` : détection de Judas Swing / Turtle Soup sur niveaux clés
 - `DiscountPremium` : zones d'équilibre
+- **Filtrage par prix** : OB/FVG/MSS > 35% du prix actuel ignorés (évite les artefacts historiques)
 
 ### `src/sessions.py`
-Détection des sessions de trading :
+Détection des sessions de trading + conformité killzone :
 - Session Asiatique (22:00-08:00 UTC)
 - Session Londres (07:00-16:00 UTC)
 - Session New York (13:00-21:00 UTC)
 - Silver Bullet (13:30-15:00 UTC)
+- **`KillzoneConformity`** : vérifie si le comportement du prix correspond aux attentes de la killzone active
+  - Score adaptatif basé sur le PD Array range (range%, volatilité, volume, sweeps)
+  - Alerte si comportement anormal
 
 ### `src/signal_generator.py`
 Génération de signaux avec scoring ICT pur :
@@ -238,8 +285,12 @@ Monitoring du compte :
 ### `src/proximity.py`
 Analyse de proximité du prix avec les concepts ICT :
 - Détection des OB, FVG, OTE, Discount/Premium, BSL/SSL, MSS proches du prix
+- **Key Levels** : PDH/PDL/PWH/PWL comme alertes de proximité
+- **Sweep alerts** : signaux de sweep intégrés comme alertes prioritaires
 - Filtre adaptatif basé sur le PD Array range
 - Génération de **setups LONG/SHORT** avec SL et TP
+  - **Sweep setups** : entrées basées sur les sweeps de niveaux clés (prioritaires)
+  - **Key level setups** : entrées basées sur la proximité BSL/SSL
 - R:R calculé automatiquement
 - **Raisons détaillées** : pourquoi l'entrée, pourquoi le SL à ce niveau, pourquoi le TP
 
@@ -249,7 +300,8 @@ Analyseur complet :
 - Matrice des biases multi-TF
 - Détection de conflits directionnels
 - Résumé top-down ICT
-- Intégration des setups de trading dans les rapports
+- Intégration des key levels, sweeps, killzone conformity dans les rapports
+- Intégration du setup tracker (log auto + vérification TP/SL)
 
 ### `src/dashboard.py`
 Interface Streamlit temps réel :
@@ -259,6 +311,17 @@ Interface Streamlit temps réel :
 - Cards métriques responsives
 - **📍 Proximité ICT** avec détails par concept
 - **🎯 Setups de trading** avec raisons entrée/SL/TP
+- **📊 Suivi des Setups** avec stats, progrès TP, par direction/source
+- **🔫 Conformité Killzone** avec comportement attendu vs observé
+- **🔄 Auto-redémarrage** intelligent en cas d'erreur transitoire (anti-boucle 3/60s)
+
+### `src/setup_tracker.py`
+Suivi des setups de trading :
+- **`TrackedSetup`** : ID unique, direction, entrée/SL/TP, statut, chemin de prix
+- **`SetupTracker`** : log, vérification continue TP/SL, stats, persistance JSON
+- Détection auto des outcomes : TP1/TP2/TP3 → WIN, SL touché → LOSS
+- Anti-doublons (même direction + prix proche + <1h)
+- Stats : win rate, R:R moyen, par direction, par source
 
 ---
 
@@ -291,6 +354,16 @@ Interface Streamlit temps réel :
 - **Sweep** : Détection de chasse de liquidité (wick)
 
 ---
+
+## 🩺 Dépannage
+
+| Problème | Solution |
+|----------|----------|
+| `[FAIL] Impossible de se connecter a MT5` | **Ouvrez d'abord le terminal MT5** et connectez-vous au compte. Le système ne lance pas MT5 automatiquement. |
+| `Port 8501 already in use` | Lancez via `python main.py dashboard` ou `start_dashboard.bat` — le cleanup automatique tuera l'ancien processus. |
+| `AttributeError` / `UnboundLocalError` après modification du code | Le dashboard détecte l'erreur et **redémarre automatiquement** en 3s (cleanup + restart). Après 3 erreurs en 60s, il s'arrête et affiche les instructions de redémarrage manuel. |
+| Dashboard ne se lance pas sous Git Bash | Le processus `python main.py dashboard` est bloquant. Ajoutez `&` à la fin (`python main.py dashboard &`) ou ouvrez un second terminal. |
+| Chemin MT5 incorrect | Modifiez `self.terminal_path` dans `src/mt5_connector.py` avec le chemin de votre terminal. |
 
 ## 📊 Résultats de performance
 

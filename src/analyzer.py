@@ -12,11 +12,12 @@ import numpy as np
 
 from .config import TIMEFRAME_HIERARCHY, TIMEFRAME_LABELS, TIMEFRAME_NAMES
 from .data_engine import DataEngine
-from .ict_concepts import MultiTimeframeAnalyzer, DiscountPremium
+from .ict_concepts import MultiTimeframeAnalyzer, DiscountPremium, KeyLevel, SweepSignal
 from .sessions import SessionDetector
 from .account_monitor import AccountMonitor
 from .signal_generator import SignalGenerator
 from .proximity import PriceProximityAnalyzer, ProximitySetup
+from .setup_tracker import SetupTracker
 
 logger = logging.getLogger("Analyzer")
 
@@ -34,6 +35,7 @@ class ICTAnalyzer:
         self.sessions = SessionDetector()
         self.account = AccountMonitor()
         self.signal_gen = SignalGenerator()
+        self.setup_tracker = SetupTracker(storage_path="mt5-reports/setup_tracker.json")
 
     def analyze_symbol(
         self, symbol: str = "XAUUSD", force_refresh: bool = False,
@@ -51,16 +53,45 @@ class ICTAnalyzer:
             return {"error": f"Impossible de récupérer les données pour {symbol}"}
 
         # 2. Analyser les concepts ICT
-        analysis = self.mtf_analyzer.analyze_all(data)
-        bias_map = self.mtf_analyzer.get_bias_matrix(analysis)
+        current_price_val = 0.0
+        for tf in ["M5", "M15", "H1"]:
+            if tf in data and data[tf] is not None and len(data[tf]) > 0:
+                current_price_val = float(data[tf]["close"].iloc[-1])
+                break
+
+        analysis = self.mtf_analyzer.analyze_all(data, current_price=current_price_val)
+        bias_map = self.mtf_analyzer.get_bias_matrix(analysis, current_price=current_price_val)
         conflicts = self.mtf_analyzer.detect_higher_timeframe_conflict(bias_map)
+
+        # 2b. Détecter les key levels (PDH, PDL, PWH, PWL, PMH, PML) et sweeps
+        key_levels = self.mtf_analyzer.detect_key_levels(data)
+        sweep_signals = self.mtf_analyzer.detect_sweeps_from_key_levels(
+            key_levels, data, current_price_val
+        )
+
+        # 2c. Calculer le PD Array range (commun à proximity et conformité)
+        pd_range = 50.0
+        for tf in ["M15", "M5", "H1"]:
+            if tf in data and data[tf] is not None and len(data[tf]) >= 10:
+                df_pd = data[tf].tail(10)
+                pd_range = float(df_pd["high"].max() - df_pd["low"].min())
+                break
 
         # 3. Sessions et prix actuel
         session_stats = self.sessions.get_session_stats()
         latest_price = self.data_engine.get_latest_price(symbol)
 
-        # 4. Générer les signaux
-        signals = self.signal_gen.generate_signals(symbol, data)
+        # 3b. Conformité killzone (le prix fait-il ce qui est attendu ?)
+        killzone_conformity = self.sessions.check_killzone_conformity(
+            data=data, sweep_signals=sweep_signals, pd_array_range=pd_range,
+        )
+
+        # 4. Générer les signaux (avec key levels + sweeps)
+        signals = self.signal_gen.generate_signals(
+            symbol, data,
+            key_levels=key_levels,
+            sweep_signals=sweep_signals,
+        )
 
         # 5. Données par timeframe
         tf_data = {}
@@ -77,18 +108,29 @@ class ICTAnalyzer:
             "time": latest_price.get("time", datetime.now()) if latest_price else datetime.now(),
         }
 
-        # 7. Proximité ICT (prix vs concepts)
+        # 7. Proximité ICT (prix vs concepts) — réutilise pd_range déjà calculé
         price_val = current.get("bid", 0) or current.get("ask", 0)
-        # PD Array range inline (evite methode separee qui pose probleme de cache Streamlit)
-        pd_range = 50.0
-        for tf in ["M15", "M5", "H1"]:
-            if tf in data and data[tf] is not None and len(data[tf]) >= 10:
-                df = data[tf].tail(10)
-                pd_range = float(df["high"].max() - df["low"].min())
-                break
         prox_analyzer = PriceProximityAnalyzer(pd_array_range=pd_range)
-        proximity = prox_analyzer.analyze(price_val, analysis)
-        proximity_setups = prox_analyzer.compute_setups(proximity, analysis, price_val)
+        proximity = prox_analyzer.analyze(
+            price_val, analysis,
+            key_levels=key_levels,
+            sweep_signals=sweep_signals,
+        )
+        proximity_setups = prox_analyzer.compute_setups(
+            proximity, analysis, price_val,
+            key_levels=key_levels,
+            sweep_signals=sweep_signals,
+        )
+
+        # Enregistrer les setups dans le tracker
+        if price_val > 0 and (signals or proximity_setups):
+            self.setup_tracker.log_setups(signals, price_val, symbol=symbol, source="signal")
+            self.setup_tracker.log_setups(proximity_setups, price_val, symbol=symbol, source="proximity")
+
+            # Vérifier les setups existants
+            high_val = latest_price.get("ask", price_val) if latest_price else price_val
+            low_val = latest_price.get("bid", price_val) if latest_price else price_val
+            self.setup_tracker.check_all(price_val, high_val, low_val)
 
         # 8. Compte
         account_stats = self.account.get_account_stats()
@@ -106,6 +148,11 @@ class ICTAnalyzer:
             "proximity": proximity,
             "proximity_setups": proximity_setups,
             "active_timeframes": active_tfs,
+            "key_levels": key_levels,
+            "sweep_signals": sweep_signals,
+            "setup_tracker_stats": self.setup_tracker.get_stats(),
+            "setup_tracker_active": self.setup_tracker.get_active(),
+            "killzone_conformity": killzone_conformity,
             "top_down_summary": self._generate_top_down_summary(bias_map, tf_data, current, active_tfs),
         }
 
@@ -362,6 +409,58 @@ class ICTAnalyzer:
                 lines.append(f"- 🛑 **SL :** {s.sl_reason}")
                 lines.append(f"- 🎯 **TP :** {s.tp_reason}")
                 lines.append("")
+
+        # Partie 3b: Key Levels (PDH, PDL, PWH, PWL, PMH, PML)
+        key_levels = analysis.get("key_levels", [])
+        if key_levels:
+            lines.append("## 🔑 NIVEAUX CLÉS (Key Levels)")
+            lines.append("")
+            lines.append("| Niveau | Prix | Type Liquidité | Distance Prix | Statut |")
+            lines.append("|--------|------|----------------|---------------|--------|")
+            order_kl = ["PMH", "PML", "PWH", "PWL", "PDH", "PDL"]
+            kl_labels = {
+                "PMH": "Plus Haut Mois Préc.", "PML": "Plus Bas Mois Préc.",
+                "PWH": "Plus Haut Semaine Préc.", "PWL": "Plus Bas Semaine Préc.",
+                "PDH": "Plus Haut Jour Préc.", "PDL": "Plus Bas Jour Préc.",
+            }
+            for lt in order_kl:
+                for kl in key_levels:
+                    if kl.level_type == lt:
+                        dist = analysis["current_price"]["bid"] - kl.level
+                        liq_type = "🟢 BSL" if kl.liquidity_type == "BSL" else "🔴 SSL"
+                        status = "🔥 SWEEPÉ" if kl.swept else "✅ Intact"
+                        lines.append(
+                            f"| **{lt}** ({kl_labels.get(lt, lt)}) | {kl.level:.1f} | {liq_type} | "
+                            f"{dist:+.1f} | {status} |"
+                        )
+            lines.append("")
+
+        # Partie 3c: Conformité Killzone
+        killzone_conf = analysis.get("killzone_conformity")
+        if killzone_conf and hasattr(killzone_conf, 'is_active') and killzone_conf.is_active:
+            lines.append("## 🔫 CONFORMITÉ KILLZONE")
+            lines.append("")
+            lines.append(f"- **Killzone active:** {killzone_conf.killzone_label}")
+            lines.append(f"- **Conformité:** {killzone_conf.conformity_label()} ({killzone_conf.conformity_score:.0%})")
+            lines.append(f"- **Attendu:** {killzone_conf.expected_behavior}")
+            lines.append(f"- **Observé:** {killzone_conf.actual_behavior}")
+            lines.append("")
+            lines.append("**Détails:**")
+            for detail in killzone_conf.details:
+                lines.append(f"- {detail}")
+            if killzone_conf.warning:
+                lines.append(f"\n⚠️ {killzone_conf.warning}")
+            lines.append("")
+
+        # Partie 3d: Sweep signals
+        sweeps = analysis.get("sweep_signals", [])
+        if sweeps:
+            lines.append("## 🔥 SIGNAUX DE SWEEP (Judas Swing / Turtle Soup)")
+            lines.append("")
+            for ss in sweeps:
+                direction = "🟢 LONG" if ss.direction == "buy" else "🔴 SHORT"
+                lines.append(f"- **{direction}** — {ss.detail}")
+            lines.append("")
 
         # Partie 4: Sessions
         lines.append("## 🕐 SESSIONS & KILL ZONES")

@@ -5,12 +5,15 @@ Détection des sessions de trading (Kill Zones) ICT :
 - Session New York
 - Silver Bullet (09:30-11:00 NY)
 - London Close / New York Open
+- Conformité killzone (le prix fait-il ce qui est attendu ?)
 """
 
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict
 from dataclasses import dataclass
+
+import pandas as pd
 
 from .config import SESSIONS, SILVER_BULLET
 
@@ -27,6 +30,41 @@ class ActiveSession:
     active: bool
     time_until_open: Optional[str] = None
     time_until_close: Optional[str] = None
+
+
+@dataclass
+class KillzoneConformity:
+    """
+    Vérifie si l'action du prix est conforme au comportement attendu
+    pour la killzone active (méthodologie ICT).
+    """
+    killzone_name: str          # "asian", "london", "newyork", "silver_bullet"
+    killzone_label: str         # "Asie", "Londres", "New York", "Silver Bullet NY"
+    is_active: bool             # La killzone est-elle active ?
+    expected_behavior: str      # Comportement attendu selon ICT
+    actual_behavior: str        # Comportement observé
+    conformity: str             # "conforme" | "partiel" | "non_conforme" | "inactif"
+    conformity_score: float     # 0.0 à 1.0
+    details: List[str]          # Détails des vérifications
+    warning: str = ""           # Avertissement si non-conforme
+
+    def conformity_label(self) -> str:
+        labels = {
+            "conforme": "✅ Conforme",
+            "partiel": "⚠️ Partiellement conforme",
+            "non_conforme": "❌ Non conforme",
+            "inactif": "⏳ Inactif",
+        }
+        return labels.get(self.conformity, self.conformity)
+
+    def conformity_color(self) -> str:
+        colors = {
+            "conforme": "#00ff88",
+            "partiel": "#ffaa00",
+            "non_conforme": "#ff4444",
+            "inactif": "#888888",
+        }
+        return colors.get(self.conformity, "#888888")
 
 
 class SessionDetector:
@@ -263,3 +301,272 @@ class SessionDetector:
         Retourne le range (haut/bas) de la session asiatique pour le calcul des zones ICT.
         """
         return {"high": None, "low": None}  # Rempli par le data engine
+
+    def check_killzone_conformity(
+        self,
+        data: Optional[Dict[str, "pd.DataFrame"]] = None,
+        sweep_signals: Optional[List] = None,
+        pd_array_range: float = 50.0,
+    ) -> KillzoneConformity:
+        """
+        Vérifie si l'action du prix est conforme au comportement attendu
+        pour la killzone active selon la méthodologie ICT.
+
+        Chaque killzone a un comportement type :
+        - Asie : Range étroit, faible volatilité, consolidation → le prix pose les niveaux du jour
+        - Londres : Trend directionnel, fort volume, volatilité → cassure des ranges asiatiques
+        - New York : Pic de liquidité, sweeps, reversals → chasse aux stops
+        - Silver Bullet : Impulsion puissante, 1.272+ PD Array → trade de précision
+        """
+        all_sessions = self.get_all_sessions()
+        active = [s for s in all_sessions if s.active]
+
+        if not active:
+            return KillzoneConformity(
+                killzone_name="none",
+                killzone_label="Aucune",
+                is_active=False,
+                expected_behavior="Aucune killzone active",
+                actual_behavior="Marché au ralenti",
+                conformity="inactif",
+                conformity_score=0.0,
+                details=["Aucune killzone ICT active actuellement."],
+            )
+
+        # Prendre la killzone la plus prioritaire
+        priority = ["silver_bullet", "newyork", "london", "asian"]
+        primary = None
+        for name in priority:
+            for s in active:
+                if s.name == name:
+                    primary = s
+                    break
+            if primary:
+                break
+        if not primary:
+            primary = active[0]
+
+        # Comportements attendus par killzone
+        expectations = {
+            "asian": {
+                "expected": "Range étroit, faible volatilité, consolidation. Le prix pose les niveaux du jour (PDH/PDL).",
+                "checks": ["range_etroit", "faible_volatilite", "consolidation"],
+            },
+            "london": {
+                "expected": "Trend directionnel, forte volatilité, cassure du range asiatique. Gros volume.",
+                "checks": ["trend_directionnel", "forte_volatilite", "cassure_range"],
+            },
+            "newyork": {
+                "expected": "Pic d'activité, chasse de liquidité (BSL/SSL), reversals. Chevauchement Londres 13-16h.",
+                "checks": ["liquidite_chassee", "forte_volatilite", "reversal_possible"],
+            },
+            "silver_bullet": {
+                "expected": "Impulsion puissante et précise, mouvement 1.272+ PD Array. Fenêtre de 90min.",
+                "checks": ["impulsion_forte", "mouvement_directionnel", "extension_fibonacci"],
+            },
+        }
+
+        exp = expectations.get(primary.name, expectations["asian"])
+        details: List[str] = []
+        score = 0.0
+        total_checks = len(exp["checks"])
+        passed = 0
+
+        # Seuils adaptatifs basés sur le PD Array range (pas de % fixe du prix)
+        tight_range_max = pd_array_range * 0.5   # Range étroit = < 50% du PD range
+        high_vol_min = pd_array_range * 1.0       # Forte volatilité = > 100% du PD range
+
+        # Analyser les données si disponibles
+        if data:
+            # Utiliser M5 ou M15 pour l'analyse intraday
+            df = None
+            for tf in ["M5", "M15", "H1"]:
+                if tf in data and data[tf] is not None and len(data[tf]) >= 10:
+                    df = data[tf]
+                    break
+
+            if df is not None and len(df) >= 10:
+                recent = df.tail(10)
+                closes = recent["close"].values
+                highs = recent["high"].values
+                lows = recent["low"].values
+                volumes = recent["volume"].values if "volume" in recent.columns else None
+
+                range_val = float(highs.max() - lows.min())
+                body_sizes = abs(closes - recent["open"].values) if "open" in recent.columns else None
+
+                # ---- Vérifications communes ----
+
+                # 1. Range étroit ? (range < 50% du PD Array range)
+                is_tight_range = range_val < tight_range_max
+
+                # 2. Forte volatilité ? (range > 100% du PD Array range)
+                is_high_vol = range_val > high_vol_min
+
+                # 3. Trend directionnel ? (HH/HL ou LH/LL clair)
+                has_trend = False
+                trend_direction = "neutre"
+                if len(highs) >= 6:
+                    first_high = highs[:3].max()
+                    last_high = highs[-3:].max()
+                    first_low = lows[:3].min()
+                    last_low = lows[-3:].min()
+                    if last_high > first_high and last_low > first_low:
+                        has_trend = True
+                        trend_direction = "haussière"
+                    elif last_high < first_high and last_low < first_low:
+                        has_trend = True
+                        trend_direction = "baissière"
+
+                # 4. Consolidation ? (pas de trend + range étroit)
+                is_consolidating = not has_trend and is_tight_range
+
+                # 5. Sweeps de liquidité détectés ?
+                has_sweeps = bool(sweep_signals) if sweep_signals else False
+
+                # 6. Impulsion forte ? (body > 2x précédent)
+                has_impulse = False
+                if body_sizes is not None and len(body_sizes) >= 2:
+                    if body_sizes[-1] > body_sizes[-2] * 2:
+                        has_impulse = True
+
+                # 7. Volume élevé ? (volume > 1.5x moyenne)
+                high_volume = False
+                if volumes is not None and len(volumes) >= 5:
+                    avg_vol = volumes[:-1].mean() if len(volumes) > 1 else volumes[0]
+                    if avg_vol > 0 and volumes[-1] > avg_vol * 1.5:
+                        high_volume = True
+
+                # ---- Vérifications spécifiques par killzone ----
+
+                if primary.name == "asian":
+                    if is_tight_range:
+                        details.append(f"✅ Range étroit ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — typique de l'Asie")
+                        passed += 1
+                    else:
+                        details.append(f"⚠️ Range large ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — inhabituel pour l'Asie")
+
+                    if is_consolidating:
+                        details.append("✅ Consolidation détectée — le prix pose les niveaux")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Mouvement directionnel — atypique pour l'Asie")
+
+                    if not high_volume:
+                        details.append("✅ Volume faible — conforme au profil Asie")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Volume élevé — pourrait annoncer une cassure")
+
+                elif primary.name == "london":
+                    if has_trend:
+                        details.append(f"✅ Trend {trend_direction} détecté — typique de Londres")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Pas de trend clair — Londres devrait être directionnel")
+
+                    if is_high_vol:
+                        details.append(f"✅ Forte volatilité ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — conforme à Londres")
+                        passed += 1
+                    else:
+                        details.append(f"⚠️ Volatilité modérée ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — Londres attend plus d'action")
+
+                    if high_volume:
+                        details.append("✅ Volume élevé — participation institutionnelle")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Volume normal — attente de confirmation")
+
+                elif primary.name == "newyork":
+                    if has_sweeps:
+                        details.append(f"✅ {len(sweep_signals)} sweep(s) de liquidité détecté(s) — typique de NY")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Aucun sweep détecté — NY devrait chasser la liquidité")
+
+                    if is_high_vol:
+                        details.append(f"✅ Forte volatilité ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — pic d'activité NY")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Volatilité modérée — NY devrait être le pic")
+
+                    # NY = potentiel de reversal
+                    if has_trend and has_sweeps:
+                        details.append("✅ Configuration reversal NY possible (trend + sweep)")
+                        passed += 1
+                    else:
+                        details.append("ℹ️ Surveiller les signes de reversal NY (Judas Swing)")
+                        passed += 0  # neutre, ne compte pas
+                        total_checks -= 1
+
+                elif primary.name == "silver_bullet":
+                    if has_impulse:
+                        details.append("✅ Impulsion forte détectée — typique du Silver Bullet")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Pas d'impulsion claire — Silver Bullet attend un mouvement puissant")
+
+                    if has_trend:
+                        details.append(f"✅ Mouvement directionnel {trend_direction} — Silver Bullet précis")
+                        passed += 1
+                    else:
+                        details.append("⚠️ Pas de direction claire — le Silver Bullet est directionnel")
+
+                    if is_high_vol:
+                        details.append(f"✅ Range expansif ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — extension 1.272+ possible")
+                        passed += 1
+                    else:
+                        details.append(f"⚠️ Range modéré ({range_val:.1f}$ vs PD range {pd_array_range:.1f}$) — attendre l'expansion")
+
+        else:
+            details.append("ℹ️ Données de prix non disponibles pour l'analyse de conformité")
+            total_checks = 0
+
+        # Calcul du score
+        if total_checks > 0:
+            score = passed / total_checks
+
+        # Déterminer la conformité
+        if score >= 0.66:
+            conformity = "conforme"
+        elif score >= 0.33:
+            conformity = "partiel"
+        else:
+            conformity = "non_conforme"
+
+        # Construire l'alerte si non conforme
+        warning = ""
+        if conformity == "non_conforme":
+            warning = (
+                f"⚠️ Le prix ne suit pas le comportement attendu pour {primary.label}. "
+                f"Soit la killzone est atypique aujourd'hui, soit un événement externe perturbe le marché. "
+                f"Prudence recommandée."
+            )
+        elif conformity == "partiel":
+            warning = (
+                f"⚠️ Le prix suit partiellement le comportement {primary.label}. "
+                f"Attendre confirmation avant d'engager une position."
+            )
+
+        # Description du comportement observé
+        if data and df is not None:
+            if has_trend:
+                actual = f"Trend {trend_direction} (range: {range_val:.1f}$)"
+            elif is_consolidating:
+                actual = f"Consolidation (range: {range_val:.1f}$)"
+            else:
+                actual = f"Range: {range_val:.1f}$, {'sweeps détectés' if has_sweeps else 'pas de sweep'}"
+        else:
+            actual = "Données insuffisantes"
+
+        return KillzoneConformity(
+            killzone_name=primary.name,
+            killzone_label=primary.label,
+            is_active=True,
+            expected_behavior=exp["expected"],
+            actual_behavior=actual,
+            conformity=conformity,
+            conformity_score=round(score, 2),
+            details=details,
+            warning=warning,
+        )

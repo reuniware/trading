@@ -5,6 +5,8 @@ Affichage temps réel des données MT5, signaux, positions, et KPIs.
 
 import time
 import logging
+import os
+import subprocess
 from typing import Dict, Optional
 from datetime import datetime, timedelta
 
@@ -25,6 +27,8 @@ from src.trade_manager import TradeManager
 from src.risk_manager import RiskManager
 from src.account_monitor import AccountMonitor
 from src.analyzer import ICTAnalyzer
+from src.setup_tracker import SetupTracker
+from src.sessions import KillzoneConformity
 
 logger = logging.getLogger("Dashboard")
 
@@ -99,6 +103,17 @@ CUSTOM_CSS = """
         color: #888;
     }
     
+    .session-badge.active.silver_bullet {
+        background: #ff450044;
+        border: 1px solid #ff4500;
+        color: #ff4500;
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+    }
+    
     /* Header */
     h1, h2, h3 { color: #e0e0e0 !important; }
     .st-emotion-cache-16idsys p { font-size: 0.9rem; }
@@ -159,6 +174,124 @@ def render_metric(label: str, value: str, color_class: str = "neutral"):
         f'</div>',
         unsafe_allow_html=True,
     )
+
+
+def _handle_fatal_error(error_name: str, error_msg: str, traceback_str: str):
+    """Redémarre automatiquement le dashboard après une erreur transitoire.
+    Protection anti-boucle : max 3 redémarrages en 60 secondes."""
+
+    project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    restart_tracker = os.path.join(project_dir, '.codebuff_restart_log.txt')
+    current_pid = os.getpid()
+
+    # Anti-boucle : compter les redémarrages récents
+    now = time.time()
+    recent_restarts = 0
+    if os.path.exists(restart_tracker):
+        try:
+            with open(restart_tracker, 'r') as f:
+                for line in f:
+                    try:
+                        ts = float(line.strip())
+                        if now - ts < 60:
+                            recent_restarts += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Afficher le message d'erreur
+    st.error(f"💥 Erreur lors de l'analyse : {error_name}: {error_msg}")
+    with st.expander("🔍 Détails techniques"):
+        st.code(traceback_str[:2000])
+
+    if recent_restarts >= 3:
+        st.error(
+            "🚫 **Redémarrage automatique DÉSACTIVÉ** — trop d'erreurs en 60 secondes.\n\n"
+            "Le code semble avoir un problème persistant. Vérifiez et corrigez le fichier concerné, "
+            "puis relancez manuellement :\n\n"
+            "```bash\npython main.py dashboard\n```"
+        )
+        try:
+            os.remove(restart_tracker)
+        except Exception:
+            pass
+        st.stop()
+
+    # Logger ce restart
+    try:
+        with open(restart_tracker, 'a') as f:
+            f.write(f"{now}\n")
+    except Exception:
+        pass
+
+    # Afficher le compte à rebours et l'explication
+    st.warning(
+        f"🔄 **Redémarrage automatique dans 3 secondes...**\n\n"
+        f"L'erreur vient probablement d'une modification du code pendant l'exécution.\n"
+        f"Le dashboard va redémarrer proprement (cleanup cache + kill PID + restart).\n\n"
+        f"📊 Redémarrages récents : **{recent_restarts + 1}/3** (max)"
+    )
+
+    st.info(
+        "💡 **Pourquoi cette erreur ?** Le code a été modifié pendant que le dashboard tournait. "
+        "Python a rechargé un module dans un état transitoire (ex: variable pas encore définie). "
+        "Le redémarrage nettoie tout et repart sur une base propre."
+    )
+
+    # Écrire un micro-script Python qui fera le restart (plus fiable qu'un .bat)
+    restart_py = os.path.join(project_dir, '.codebuff_restart.py')
+    with open(restart_py, 'w', encoding='utf-8') as f:
+        f.write(f'''import time, os, sys, subprocess, shutil
+
+# Attendre que Streamlit ait rendu la page d'erreur
+time.sleep(3)
+
+# Tuer l'ancien processus
+try:
+    subprocess.run(["taskkill", "/f", "/pid", "{current_pid}"], capture_output=True, timeout=10)
+except Exception:
+    pass
+
+time.sleep(1)
+
+# Nettoyer les caches
+project_dir = r"{project_dir}"
+os.chdir(project_dir)
+for root, dirs, files in os.walk("."):
+    if ".git" in root or ".venv" in root:
+        continue
+    for d in dirs:
+        if d == "__pycache__":
+            shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    for f in files:
+        if f.endswith(".pyc"):
+            try:
+                os.remove(os.path.join(root, f))
+            except Exception:
+                pass
+
+# Redémarrer le dashboard
+subprocess.run([sys.executable, "main.py", "dashboard"])
+
+# Nettoyer ce script de restart (ne plus encombrer le projet)
+try:
+    os.remove(__file__)
+except Exception:
+    pass
+''')
+
+    # Lancer le restart en processus détaché (fenêtre cachée)
+    DETACHED = 0x00000008  # DETACHED_PROCESS
+    CREATE_NO_WINDOW = 0x08000000
+    subprocess.Popen(
+        [sys.executable, restart_py],
+        creationflags=DETACHED | CREATE_NO_WINDOW,
+    )
+
+    # Laisser Streamlit le temps de render avant que le restart ne tue le processus
+    time.sleep(0.5)
+    st.stop()
 
 
 def render_candle_chart(df: pd.DataFrame, symbol: str, tf_label: str, show_ict: bool = True):
@@ -274,7 +407,11 @@ def render_dashboard():
     init_state()
 
     # ─── Computations avant sidebar (nécessaires pour les badges) ────
-    all_sessions = st.session_state.session_detector.get_all_sessions()
+    try:
+        all_sessions = st.session_state.session_detector.get_all_sessions()
+    except Exception as e:
+        st.error(f"⚠️ Erreur session detector: {e}")
+        all_sessions = []
     countdown_str = ""
     for s in all_sessions:
         if s.active and s.time_until_close:
@@ -348,6 +485,8 @@ def render_dashboard():
         # Réutilise all_sessions calculé avant le sidebar
         for s in all_sessions:
             cls = "active" if s.active else "inactive"
+            if s.name == "silver_bullet":
+                cls += " silver_bullet"
             badge_text = s.label
             if s.active and s.time_until_close:
                 badge_text += f" ({s.time_until_close})"
@@ -367,12 +506,17 @@ def render_dashboard():
     # ─── Refresh data ─────────────────────────────────────────────────
     now = time.time()
     active_tfs = st.session_state.active_tfs
-    if st.session_state.autorefresh or now - st.session_state.last_refresh > 30:
-        st.session_state.analyzer = ICTAnalyzer()
-        analysis = st.session_state.analyzer.analyze_symbol(symbol, force_refresh=True, timeframes=active_tfs)
-        st.session_state.last_refresh = now
-    else:
-        analysis = st.session_state.analyzer.analyze_symbol(symbol, timeframes=active_tfs)
+    try:
+        if st.session_state.autorefresh or now - st.session_state.last_refresh > 30:
+            st.session_state.analyzer = ICTAnalyzer()
+            analysis = st.session_state.analyzer.analyze_symbol(symbol, force_refresh=True, timeframes=active_tfs)
+            st.session_state.last_refresh = now
+        else:
+            analysis = st.session_state.analyzer.analyze_symbol(symbol, timeframes=active_tfs)
+    except Exception as e:
+        # Survivre aux erreurs de code transitoires (ex: variable non définie entre 2 édits)
+        import traceback
+        _handle_fatal_error(type(e).__name__, str(e), traceback.format_exc())
 
     if "error" in analysis:
         st.error(analysis["error"])
@@ -389,11 +533,22 @@ def render_dashboard():
     )
     macro_color = {"bullish": "#00ff88", "bearish": "#ff4444", "neutral": "#ffaa00"}.get(macro["macro_bias"], "#888")
 
+    # Conformité killzone
+    killzone_conf = analysis.get("killzone_conformity")
+    if killzone_conf and not hasattr(killzone_conf, 'is_active'):
+        killzone_conf = None  # Sérialisation invalide, ignorer
+
     # Le décompte countdown_str est déjà calculé avant le sidebar
     if countdown_str:
         macro_label_full = f"{macro['macro_label']} — {countdown_str}"
     else:
         macro_label_full = macro["macro_label"]
+
+    # Ajouter la conformité killzone dans la bannière
+    if killzone_conf and killzone_conf.is_active:
+        conf_icon = {"conforme": "✅", "partiel": "⚠️", "non_conforme": "❌"}.get(killzone_conf.conformity, "")
+        conf_color = killzone_conf.conformity_color()
+        macro_label_full += f"  |  {conf_icon} Killzone: {killzone_conf.conformity_label()}"
 
     st.markdown(
         f'<div style="background:linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);'
@@ -404,19 +559,33 @@ def render_dashboard():
         unsafe_allow_html=True,
     )
 
+    # Alerte conformité si non-conforme
+    if killzone_conf and killzone_conf.warning:
+        wcol = "#ff4444" if killzone_conf.conformity == "non_conforme" else "#ffaa00"
+        st.markdown(
+            f'<div style="background:#2a1a1a;border:1px solid {wcol};border-radius:8px;'
+            f'padding:8px 16px;margin-bottom:12px;font-size:0.85rem;color:{wcol};">'
+            f'{killzone_conf.warning}</div>',
+            unsafe_allow_html=True,
+        )
+
     # ─── Row 1: Explications ICT (expandeur) ────────────────────────────
     with st.expander("📖 Guide ICT — Killzones & Macro", expanded=False):
         kz_now = macro.get("active_killzone", "")
+        # Toutes les killzones actives (pas seulement la primaire)
+        all_active_labels = [s.label for s in all_sessions if s.active]
 
-        def _kz_row(emoji, name, utc, desc, active_kz):
+        def _kz_row(emoji, name, utc, desc, active_labels):
             """Génère une ligne de tableau killzone avec mise en évidence si active."""
-            if name == active_kz:
+            is_active = name in active_labels
+            if is_active:
                 return f"| 🟢👉 **{emoji} {name}** | {utc} | **{desc}** |"
             return f"| {emoji} {name} | {utc} | {desc} |"
 
-        def _att_li(name, advice, active_kz):
+        def _att_li(name, advice, active_labels):
             """Génère une ligne d'attitude avec highlight si active."""
-            if name == active_kz:
+            is_active = name in active_labels
+            if is_active:
                 return f"- 🟢👉 **{name} → {advice}** *(actif maintenant)*"
             return f"- **{name}** → {advice}"
 
@@ -431,7 +600,7 @@ def render_dashboard():
 
         with col_kz:
             # Tableau des killzones avec la ligne active en évidence
-            kz_rows = "\n".join(_kz_row(*k[:4], kz_now) for k in kz_info)
+            kz_rows = "\n".join(_kz_row(*k[:4], all_active_labels) for k in kz_info)
             st.markdown(f"""**🔫 Kill Zones** — Créneaux horaires à forte activité
 
 | Zone | UTC | Comportement |
@@ -440,7 +609,7 @@ def render_dashboard():
 """)
 
             # Attitude avec la ligne active en évidence
-            att_lines = "\n".join(_att_li(k[1], k[4], kz_now) for k in kz_info)
+            att_lines = "\n".join(_att_li(k[1], k[4], all_active_labels) for k in kz_info)
             st.markdown(f"**Attitude par killzone :**\n{att_lines}")
 
             if kz_now:
@@ -791,6 +960,143 @@ def render_dashboard():
             )
     else:
         st.info("Aucun setup de trading basé sur la proximité ICT.")
+
+    # ─── Row 8: Suivi des Setups (Tracker) ────────────────────────────
+    st.divider()
+    st.subheader("📊 Suivi des Setups de Trading")
+
+    tracker_stats = analysis.get("setup_tracker_stats", {})
+    tracker_active = analysis.get("setup_tracker_active", [])
+
+    col_track_stats, col_track_active = st.columns([1, 2])
+
+    with col_track_stats:
+        total = tracker_stats.get("total_tracked", 0)
+        active_count = tracker_stats.get("active", 0)
+        completed = tracker_stats.get("completed", 0)
+        wins = tracker_stats.get("wins", 0)
+        losses = tracker_stats.get("losses", 0)
+        win_rate = tracker_stats.get("win_rate", 0)
+        avg_rr = tracker_stats.get("avg_rr_realized", 0)
+
+        st.markdown("#### 📈 Performance Globale")
+
+        cols = st.columns(2)
+        with cols[0]:
+            render_metric("Total Trackés", str(total), "neutral")
+            render_metric("Actifs", str(active_count), "neutral")
+        with cols[1]:
+            wr_color = "positive" if win_rate >= 50 else ("neutral" if win_rate >= 30 else "negative")
+            render_metric("Win Rate", f"{win_rate}%", wr_color)
+            render_metric("R:R Moyen", f"{avg_rr}", "positive" if avg_rr >= 1.5 else "neutral")
+
+        cols2 = st.columns(2)
+        with cols2[0]:
+            render_metric("✅ Wins", str(wins), "positive")
+        with cols2[1]:
+            render_metric("❌ Losses", str(losses), "negative")
+
+        # Par direction
+        long_data = tracker_stats.get("long", {})
+        short_data = tracker_stats.get("short", {})
+        if long_data or short_data:
+            st.caption(
+                f"🟢 LONG: {long_data.get('wins', 0)}W / {long_data.get('losses', 0)}L | "
+                f"🔴 SHORT: {short_data.get('wins', 0)}W / {short_data.get('losses', 0)}L"
+            )
+
+        # Par source
+        by_source = tracker_stats.get("by_source", {})
+        if by_source:
+            st.markdown("**Par source :**")
+            for src, counts in by_source.items():
+                total_src = counts.get("wins", 0) + counts.get("losses", 0)
+                wr_src = counts.get("wins", 0) / total_src * 100 if total_src > 0 else 0
+                st.caption(f"  {src}: {counts.get('wins', 0)}W/{counts.get('losses', 0)}L ({wr_src:.0f}%)")
+
+    with col_track_active:
+        st.markdown("#### 🔄 Setups Actifs")
+        if tracker_active:
+            active_rows = []
+            for ts in tracker_active[:10]:
+                entry = ts.entry_mid
+                direction_label = ts.get_direction_label()
+                distance = (analysis.get("current_price", {}).get("bid", 0) or 0) - entry
+                dist_pct = abs(distance) / max(entry, 1) * 100
+
+                # Progrès vers TP (approximation)
+                progress = 0.0
+                if ts.direction == "long" and ts.target_1 > entry and ts.target_1 != entry:
+                    current = analysis.get("current_price", {}).get("bid", 0) or 0
+                    progress = max(0, min((current - entry) / (ts.target_1 - entry) * 100, 100))
+                elif ts.direction == "short" and ts.target_1 < entry and ts.target_1 != entry:
+                    current = analysis.get("current_price", {}).get("bid", 0) or 0
+                    progress = max(0, min((entry - current) / (entry - ts.target_1) * 100, 100))
+
+                active_rows.append({
+                    "ID": ts.id,
+                    "Dir.": direction_label,
+                    "Entrée": f"{ts.entry_mid:.1f}",
+                    "SL": f"{ts.stop_loss:.1f}",
+                    "TP1": f"{ts.target_1:.1f}",
+                    "Force": f"{ts.strength:.0%}",
+                    "Progrès": f"{progress:.0f}%",
+                    "Détecté": ts.detected_at[:16] if ts.detected_at else "N/A",
+                })
+
+            if active_rows:
+                df_active = pd.DataFrame(active_rows)
+                st.dataframe(
+                    df_active,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "ID": st.column_config.TextColumn("🆔 ID", width="small"),
+                        "Dir.": st.column_config.TextColumn("🎯 Dir", width="small"),
+                        "Entrée": st.column_config.TextColumn("💰 Entrée", width="small"),
+                        "SL": st.column_config.TextColumn("🛑 SL", width="small"),
+                        "TP1": st.column_config.TextColumn("TP1", width="small"),
+                        "Force": st.column_config.TextColumn("💪 Force", width="small"),
+                        "Progrès": st.column_config.TextColumn("📈 Progrès", width="small"),
+                        "Détecté": st.column_config.TextColumn("🕐 Détecté", width="medium"),
+                    },
+                )
+        else:
+            st.info("Aucun setup actif en suivi. Les setups détectés apparaîtront ici.")
+
+    # ─── Row 9: Conformité Killzone ──────────────────────────────────
+    if killzone_conf and killzone_conf.is_active:
+        st.divider()
+        st.subheader("🔫 Conformité Killzone")
+
+        col_conf, col_details = st.columns([1, 2])
+
+        with col_conf:
+            conf_label = killzone_conf.conformity_label()
+            conf_color = killzone_conf.conformity_color()
+            score_pct = f"{killzone_conf.conformity_score:.0%}"
+
+            st.markdown(
+                f'<div style="border:2px solid {conf_color};border-radius:12px;padding:20px;text-align:center;">'
+                f'<div style="font-size:0.8rem;color:#888;text-transform:uppercase;">Conformité {killzone_conf.killzone_label}</div>'
+                f'<div style="font-size:1.5rem;color:{conf_color};font-weight:700;margin-top:8px;">{conf_label}</div>'
+                f'<div style="font-size:1.2rem;color:{conf_color};margin-top:4px;">{score_pct}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        with col_details:
+            st.markdown(f"**Comportement attendu ({killzone_conf.killzone_label}) :**")
+            st.caption(killzone_conf.expected_behavior)
+            st.markdown(f"**Comportement observé :** {killzone_conf.actual_behavior}")
+            st.markdown("**Détails :**")
+            for detail in killzone_conf.details:
+                if detail.startswith("✅"):
+                    st.success(detail)
+                elif detail.startswith("⚠️"):
+                    st.warning(detail)
+                else:
+                    st.info(detail)
 
     # ─── Footer auto-refresh ──────────────────────────────────────────
     st.divider()

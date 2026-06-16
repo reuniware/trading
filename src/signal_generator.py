@@ -11,7 +11,7 @@ from datetime import datetime
 from .config import TIMEFRAME_HIERARCHY
 from .ict_concepts import (
     MultiTimeframeAnalyzer, OrderBlock, FairValueGap,
-    MarketStructureShift, LiquidityLevel, DiscountPremium,
+    MarketStructureShift, LiquidityLevel, DiscountPremium, KeyLevel, SweepSignal,
 )
 from .sessions import SessionDetector
 
@@ -50,6 +50,8 @@ class SignalGenerator:
         self,
         symbol: str,
         data: Dict[str, "pd.DataFrame"],
+        key_levels: Optional[List[KeyLevel]] = None,
+        sweep_signals: Optional[List[SweepSignal]] = None,
     ) -> List[TradeSignal]:
         """
         Analyse toute la structure de données et génère les signaux.
@@ -58,22 +60,33 @@ class SignalGenerator:
             return []
 
         # Analyse multi-TF
-        analysis = self.analyzer.analyze_all(data)
-        bias_map = self.analyzer.get_bias_matrix(analysis)
+        current_price = self._get_current_price(data)
+        analysis = self.analyzer.analyze_all(data, current_price=current_price)
+        bias_map = self.analyzer.get_bias_matrix(analysis, current_price=current_price)
         conflicts = self.analyzer.detect_higher_timeframe_conflict(bias_map)
         sessions = self.session_detector.get_session_stats()
+
+        # Si pas fourni, détecter les key levels et sweeps
+        if key_levels is None and data:
+            key_levels = self.analyzer.detect_key_levels(data)
+        if sweep_signals is None and key_levels and current_price > 0:
+            sweep_signals = self.analyzer.detect_sweeps_from_key_levels(
+                key_levels, data, current_price
+            )
 
         signals: List[TradeSignal] = []
 
         # Générer les signaux basés sur la confluence
         buy_signal = self._evaluate_direction(
-            symbol, "buy", data, analysis, bias_map, conflicts, sessions
+            symbol, "buy", data, analysis, bias_map, conflicts,
+            sessions, key_levels, sweep_signals
         )
         if buy_signal:
             signals.append(buy_signal)
 
         sell_signal = self._evaluate_direction(
-            symbol, "sell", data, analysis, bias_map, conflicts, sessions
+            symbol, "sell", data, analysis, bias_map, conflicts,
+            sessions, key_levels, sweep_signals
         )
         if sell_signal:
             signals.append(sell_signal)
@@ -86,6 +99,8 @@ class SignalGenerator:
         self, symbol: str, direction: str,
         data: Dict, analysis: Dict, bias_map: Dict,
         conflicts: List[str], sessions: Dict,
+        key_levels: Optional[List[KeyLevel]] = None,
+        sweep_signals: Optional[List[SweepSignal]] = None,
     ) -> Optional[TradeSignal]:
         """
         Evalue un signal pour une direction donnee.
@@ -188,6 +203,26 @@ class SignalGenerator:
         if sessions.get("is_killzone_active"):
             score += 4
             reasons.append("Kill Zone active")
+
+        # === 3b. Sweep de key levels (max +15 points) ===
+        if sweep_signals:
+            for ss in sweep_signals:
+                if ss.confirmation and ss.direction == direction:
+                    score += 12
+                    reasons.append(f"SWEEP {ss.level.level_type} ({ss.level.label}) confirmé")
+                elif ss.confirmation:
+                    # Sweep dans la direction opposée = conflit
+                    score -= 5
+                    reasons.append(f"SWEEP opposé {ss.level.level_type}")
+
+        # === 3c. Confluence de liquidité BSL/SSL (max +8 points) ===
+        if key_levels:
+            pd_range_confluence = self._get_pd_array_range(data)
+            liq_bonus = self._score_liquidity_confluence(direction, key_levels, current_price, pd_range_confluence)
+            score += liq_bonus
+            if liq_bonus >= 5:
+                reasons.append(f"Confluence liquidité ({liq_bonus:.0f} pts)")
+
         if conflicts:
             score -= 10
             reasons.append(f"Conflit TF: {', '.join(conflicts[:2])}")
@@ -437,6 +472,56 @@ class SignalGenerator:
             if tf in analysis:
                 return tf
         return "M15"
+
+    def _score_liquidity_confluence(
+        self, direction: str, key_levels: List[KeyLevel], current_price: float,
+        pd_range: float = 50.0,
+    ) -> float:
+        """
+        Score la confluence de liquidité proche.
+        Plusieurs BSL proches = forte attraction haussière.
+        Plusieurs SSL proches = forte attraction baissière.
+        """
+        if current_price <= 0 or not key_levels:
+            return 0.0
+
+        max_dist = pd_range * 3
+
+        score = 0.0
+        if direction == "buy":
+            # Compter les SSL proches = attraction baissière puis rebond = signal LONG
+            ssl_near = [kl for kl in key_levels
+                        if kl.liquidity_type == "SSL"
+                        and abs(kl.level - current_price) < max_dist]
+            if len(ssl_near) >= 2:
+                score += 5
+            elif len(ssl_near) == 1:
+                score += 2
+
+            # BSL sweepés au-dessus = confirmation
+            bsl_swept = [kl for kl in key_levels
+                         if kl.liquidity_type == "BSL" and kl.swept
+                         and abs(kl.level - current_price) < max_dist]
+            if len(bsl_swept) >= 1:
+                score += 3
+        else:
+            # Compter les BSL proches = attraction haussière puis rejet = signal SHORT
+            bsl_near = [kl for kl in key_levels
+                        if kl.liquidity_type == "BSL"
+                        and abs(kl.level - current_price) < max_dist]
+            if len(bsl_near) >= 2:
+                score += 5
+            elif len(bsl_near) == 1:
+                score += 2
+
+            # SSL sweepés en-dessous = confirmation
+            ssl_swept = [kl for kl in key_levels
+                         if kl.liquidity_type == "SSL" and kl.swept
+                         and abs(kl.level - current_price) < max_dist]
+            if len(ssl_swept) >= 1:
+                score += 3
+
+        return score
 
     def get_signal_summary(self, signals: List[TradeSignal]) -> str:
         """Résumé formaté pour l'affichage."""

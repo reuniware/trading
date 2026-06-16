@@ -102,6 +102,13 @@ class ICTConfig:
     liq_lookback: int = 50              # Barres à scruter pour liquidité
     liq_sweep_percent: float = 0.05     # % de sweep pour détection
 
+    # Key Levels (PDH/PDL/PWH/PWL/PMH/PML)
+    key_level_max_distance_pct: float = 0.35  # % max du prix pour considérer un key level
+    key_level_sweep_threshold: float = 0.1    # % min pour confirmer un sweep
+
+    # Filtrage concepts obsolètes
+    concept_max_price_distance_pct: float = 0.35  # % max d'écart prix pour les OB/FVG/MSS
+
 # ─── Instances globales ────────────────────────────────────────────────────
 RISK = RiskConfig()
 ICT = ICTConfig()

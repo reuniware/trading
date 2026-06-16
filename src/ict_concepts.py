@@ -97,6 +97,55 @@ class DiscountPremium:
     range_low: float
 
 
+@dataclass
+class KeyLevel:
+    """
+    Niveau de prix clé : PDH, PDL, PWH, PWL, PMH, PML.
+    Ces niveaux sont des zones de liquidité naturelles que le prix
+    cherche à atteindre (BSL au-dessus, SSL en-dessous).
+    """
+    level_type: str   # "PDH" | "PDL" | "PWH" | "PWL" | "PMH" | "PML"
+    level: float
+    time: Any          # Timestamp de la bougie source
+    source_tf: str     # "D1", "W1", "MN1"
+    strength: float    # 0.0 à 1.0 (PMH/PML > PWH/PWL > PDH/PDL)
+    swept: bool = False
+    sweep_direction: Optional[str] = None  # "up" | "down" | None
+
+    @property
+    def liquidity_type(self) -> str:
+        """BSL si le niveau est un haut (PDH, PWH, PMH), SSL si bas."""
+        return "BSL" if self.level_type in ("PDH", "PWH", "PMH") else "SSL"
+
+    @property
+    def label(self) -> str:
+        labels = {
+            "PDH": "Plus Haut du Jour Précédent",
+            "PDL": "Plus Bas du Jour Précédent",
+            "PWH": "Plus Haut de la Semaine Précédente",
+            "PWL": "Plus Bas de la Semaine Précédente",
+            "PMH": "Plus Haut du Mois Précédent",
+            "PML": "Plus Bas du Mois Précédent",
+        }
+        return labels.get(self.level_type, self.level_type)
+
+
+@dataclass
+class SweepSignal:
+    """
+    Signal de sweep de liquidité ICT.
+    Judas Swing / Turtle Soup : le prix casse un niveau clé
+    puis s'inverse — signal de trading très puissant.
+    """
+    level: KeyLevel
+    direction: str      # "buy" (sweep SSL → remonte) | "sell" (sweep BSL → redescend)
+    sweep_bar_index: int
+    sweep_bar_time: Any
+    confirmation: bool  # True si le prix a confirmé le reversal
+    strength: float
+    detail: str = ""
+
+
 # ─── Détecteurs ─────────────────────────────────────────────────────────────
 
 class ICTConceptsDetector:
@@ -461,16 +510,42 @@ class ICTConceptsDetector:
 
     # ── Analyse complète ────────────────────────────────────────────────────
 
-    def analyze(self, df: pd.DataFrame) -> dict:
+    def analyze(self, df: pd.DataFrame, current_price: float = 0.0) -> dict:
         """Analyse complète de tous les concepts ICT sur un DataFrame."""
+        obs = self.detect_order_blocks(df)
+        fvgs = self.detect_fvg(df)
+        mss_list = self.detect_mss(df)
+        liq = self.detect_liquidity(df)
+        dp = self.detect_discount_premium(df)
+        gaps = self.detect_price_gaps(df)
+
+        # Filtrer les concepts trop éloignés du prix (> 35% d'écart par défaut)
+        if current_price > 0:
+            max_pct = self.cfg.concept_max_price_distance_pct
+            obs = self._filter_by_price(obs, current_price, max_pct)
+            fvgs = self._filter_by_price_fvg(fvgs, current_price, max_pct)
+            mss_list = self._filter_by_price_mss(mss_list, current_price, max_pct)
+
         return {
-            "order_blocks": self.detect_order_blocks(df),
-            "fvgs": self.detect_fvg(df),
-            "price_gaps": self.detect_price_gaps(df),
-            "mss": self.detect_mss(df),
-            "liquidity": self.detect_liquidity(df),
-            "discount_premium": self.detect_discount_premium(df),
+            "order_blocks": obs,
+            "fvgs": fvgs,
+            "price_gaps": gaps,
+            "mss": mss_list,
+            "liquidity": liq,
+            "discount_premium": dp,
         }
+
+    def _filter_by_price(self, items: List, price: float, max_pct: float) -> List:
+        """Filtre les items dont le prix est trop éloigné du prix actuel."""
+        return [x for x in items if abs((x.high + x.low) / 2 - price) / price < max_pct]
+
+    def _filter_by_price_fvg(self, items: List, price: float, max_pct: float) -> List:
+        """Filtre les FVG trop éloignés."""
+        return [x for x in items if abs((x.upper + x.lower) / 2 - price) / price < max_pct]
+
+    def _filter_by_price_mss(self, items: List, price: float, max_pct: float) -> List:
+        """Filtre les MSS trop éloignés."""
+        return [x for x in items if abs(x.break_level - price) / price < max_pct]
 
 
 class MultiTimeframeAnalyzer:
@@ -484,18 +559,194 @@ class MultiTimeframeAnalyzer:
             self.detectors[tf_name] = ICTConceptsDetector(tf_name)
         return self.detectors[tf_name]
 
-    def analyze_all(self, data: Dict[str, pd.DataFrame]) -> Dict[str, dict]:
-        """Analyse tous les timeframes disponibles."""
+    def analyze_all(self, data: Dict[str, pd.DataFrame], current_price: float = 0.0) -> Dict[str, dict]:
+        """Analyse tous les timeframes disponibles avec filtrage par prix."""
         results = {}
         for tf_name, df in data.items():
             if df is not None and len(df) > 10:
                 detector = self.get_detector(tf_name)
-                results[tf_name] = detector.analyze(df)
+                results[tf_name] = detector.analyze(df, current_price=current_price)
         return results
 
-    def get_bias_matrix(self, results: Dict[str, dict]) -> Dict[str, str]:
+    # ── Key Levels (PDH, PDL, PWH, PWL, PMH, PML) ───────────────────────
+
+    def detect_key_levels(self, data: Dict[str, pd.DataFrame]) -> List[KeyLevel]:
+        """
+        Détecte les niveaux clés ICT :
+        - PDH/PDL : Plus Haut/Bas du Jour Précédent (depuis D1)
+        - PWH/PWL : Plus Haut/Bas de la Semaine Précédente (depuis W1)
+        - PMH/PML : Plus Haut/Bas du Mois Précédent (depuis MN1)
+        
+        Ces niveaux sont des aimants à liquidité. Le prix les cherche naturellement.
+        """
+        levels: List[KeyLevel] = []
+
+        # PDH/PDL — depuis les données D1
+        if "D1" in data and data["D1"] is not None and len(data["D1"]) >= 2:
+            d1 = data["D1"]
+            prev_day = d1.iloc[-2]
+            current_day = d1.iloc[-1]
+
+            pdh = float(prev_day["high"])
+            pdl = float(prev_day["low"])
+
+            # Sweep detection: le prix d'aujourd'hui a-t-il déjà dépassé ces niveaux ?
+            pdh_swept = bool(current_day["high"] > pdh) if len(current_day) > 0 else False
+            pdl_swept = bool(current_day["low"] < pdl) if len(current_day) > 0 else False
+
+            levels.append(KeyLevel("PDH", pdh, d1.index[-2], "D1", 0.90,
+                                   swept=pdh_swept, sweep_direction="up" if pdh_swept else None))
+            levels.append(KeyLevel("PDL", pdl, d1.index[-2], "D1", 0.90,
+                                   swept=pdl_swept, sweep_direction="down" if pdl_swept else None))
+
+        # PWH/PWL — depuis les données W1
+        if "W1" in data and data["W1"] is not None and len(data["W1"]) >= 2:
+            w1 = data["W1"]
+            prev_week = w1.iloc[-2]
+            current_week = w1.iloc[-1]
+
+            pwh = float(prev_week["high"])
+            pwl = float(prev_week["low"])
+
+            pwh_swept = bool(current_week["high"] > pwh) if len(current_week) > 0 else False
+            pwl_swept = bool(current_week["low"] < pwl) if len(current_week) > 0 else False
+
+            levels.append(KeyLevel("PWH", pwh, w1.index[-2], "W1", 0.95,
+                                   swept=pwh_swept, sweep_direction="up" if pwh_swept else None))
+            levels.append(KeyLevel("PWL", pwl, w1.index[-2], "W1", 0.95,
+                                   swept=pwl_swept, sweep_direction="down" if pwl_swept else None))
+
+        # PMH/PML — depuis les données MN1
+        if "MN1" in data and data["MN1"] is not None and len(data["MN1"]) >= 2:
+            mn1 = data["MN1"]
+            prev_month = mn1.iloc[-2]
+            current_month = mn1.iloc[-1]
+
+            pmh = float(prev_month["high"])
+            pml = float(prev_month["low"])
+
+            pmh_swept = bool(current_month["high"] > pmh) if len(current_month) > 0 else False
+            pml_swept = bool(current_month["low"] < pml) if len(current_month) > 0 else False
+
+            levels.append(KeyLevel("PMH", pmh, mn1.index[-2], "MN1", 1.0,
+                                   swept=pmh_swept, sweep_direction="up" if pmh_swept else None))
+            levels.append(KeyLevel("PML", pml, mn1.index[-2], "MN1", 1.0,
+                                   swept=pml_swept, sweep_direction="down" if pml_swept else None))
+
+        return levels
+
+    def detect_liquidity_from_key_levels(self, key_levels: List[KeyLevel]) -> List[LiquidityLevel]:
+        """
+        Convertit les key levels (PDH, PDL, etc.) en niveaux de liquidité BSL/SSL.
+        PDH/PWH/PMH = BSL (le prix est attiré vers le haut pour chasser ces stops)
+        PDL/PWL/PML = SSL (le prix est attiré vers le bas)
+        """
+        liquidity = []
+        for kl in key_levels:
+            liq_type = "BSL" if kl.level_type in ("PDH", "PWH", "PMH") else "SSL"
+            liquidity.append(LiquidityLevel(
+                tf=kl.source_tf,
+                type=liq_type,
+                level=kl.level,
+                index=-1,
+                time=kl.time,
+                strength=kl.strength,
+                swept=kl.swept,
+            ))
+        return liquidity
+
+    def detect_sweeps_from_key_levels(
+        self, key_levels: List[KeyLevel],
+        data: Dict[str, pd.DataFrame],
+        current_price: float,
+    ) -> List[SweepSignal]:
+        """
+        Détecte les sweeps de key levels (Judas Swing / Turtle Soup).
+        
+        Un sweep SSL (PDL/PWL/PML cassé vers le bas puis prix remonte) = signal BUY.
+        Un sweep BSL (PDH/PWH/PMH cassé vers le haut puis prix redescend) = signal SELL.
+        """
+        signals: List[SweepSignal] = []
+
+        if not key_levels or current_price <= 0:
+            return signals
+
+        # Utiliser M15 ou M5 pour confirmer le sweep intraday
+        confirm_tf = None
+        confirm_df = None
+        for tf in ["M15", "M5", "H1"]:
+            if tf in data and data[tf] is not None and len(data[tf]) >= 5:
+                confirm_tf = tf
+                confirm_df = data[tf]
+                break
+
+        if confirm_df is None:
+            confirm_df = data.get("D1")
+            confirm_tf = "D1"
+        if confirm_df is None:
+            return signals
+
+        recent = confirm_df.tail(2)  # Seulement les 2 dernières barres pour éviter faux positifs
+        recent_high = float(recent["high"].max())
+        recent_low = float(recent["low"].min())
+        recent_close = float(recent["close"].iloc[-1])
+
+        for kl in key_levels:
+            if kl.swept:
+                continue
+
+            # SSL Sweep → BUY signal (prix passe sous PDL/PWL/PML puis remonte)
+            if kl.liquidity_type == "SSL":
+                if recent_low <= kl.level and recent_close > kl.level:
+                    strength = min(abs(kl.level - recent_low) / (kl.level * 0.005), 1.0)
+                    detail = (
+                        f"🎯 SWEEP SSL {kl.level_type} ({kl.label}) — "
+                        f"Prix a cassé {kl.level:.1f}$ vers le bas puis est remonté à {current_price:.1f}$ "
+                        f"→ Signal LONG (Judas Swing / Turtle Soup)"
+                    )
+                    signals.append(SweepSignal(
+                        level=kl,
+                        direction="buy",
+                        sweep_bar_index=-1,
+                        sweep_bar_time=recent.index[-1],
+                        confirmation=True,
+                        strength=strength,
+                        detail=detail,
+                    ))
+                    kl.swept = True
+                    kl.sweep_direction = "down"
+
+            # BSL Sweep → SELL signal (prix passe au-dessus PDH/PWH/PMH puis redescend)
+            elif kl.liquidity_type == "BSL":
+                if recent_high >= kl.level and recent_close < kl.level:
+                    strength = min(abs(recent_high - kl.level) / (kl.level * 0.005), 1.0)
+                    detail = (
+                        f"🎯 SWEEP BSL {kl.level_type} ({kl.label}) — "
+                        f"Prix a cassé {kl.level:.1f}$ vers le haut puis est redescendu à {current_price:.1f}$ "
+                        f"→ Signal SHORT (Judas Swing / Turtle Soup)"
+                    )
+                    signals.append(SweepSignal(
+                        level=kl,
+                        direction="sell",
+                        sweep_bar_index=-1,
+                        sweep_bar_time=recent.index[-1],
+                        confirmation=True,
+                        strength=strength,
+                        detail=detail,
+                    ))
+                    kl.swept = True
+                    kl.sweep_direction = "up"
+
+        return signals
+
+    # ── Bias Matrix (avec filtrage prix + recence) ──────────────────────
+
+    def get_bias_matrix(
+        self, results: Dict[str, dict], current_price: float = 0.0
+    ) -> Dict[str, str]:
         """
         Calcule le bias pour chaque timeframe basé sur les concepts détectés.
+        Les concepts sont pondérés par leur force et filtrés par proximité de prix.
         Retourne: {"MN1": "bearish", "W1": "bearish", "D1": "neutral", ...}
         """
         bias_map = {}
@@ -503,26 +754,29 @@ class MultiTimeframeAnalyzer:
             bullish_score = 0.0
             bearish_score = 0.0
 
-            # Order Blocks
+            # Order Blocks (pondérés par force)
             for ob in analysis.get("order_blocks", []):
+                weight = ob.strength * 2
                 if ob.type == "bullish":
-                    bullish_score += ob.strength * 2
+                    bullish_score += weight
                 else:
-                    bearish_score += ob.strength * 2
+                    bearish_score += weight
 
-            # FVGs
+            # FVGs (pondérés par force)
             for fvg in analysis.get("fvgs", []):
+                weight = fvg.strength * 1.5
                 if fvg.type == "bullish":
-                    bullish_score += fvg.strength * 1.5
+                    bullish_score += weight
                 else:
-                    bearish_score += fvg.strength * 1.5
+                    bearish_score += weight
 
-            # MSS
+            # MSS (pondérés par force)
             for mss in analysis.get("mss", []):
+                weight = mss.strength * 3
                 if mss.direction == "bullish":
-                    bullish_score += mss.strength * 3
+                    bullish_score += weight
                 else:
-                    bearish_score += mss.strength * 3
+                    bearish_score += weight
 
             # Décision
             if bullish_score > bearish_score + 1.0:
