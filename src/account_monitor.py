@@ -80,19 +80,22 @@ class AccountMonitor:
         balance = account.get("balance", 0)
         equity = account.get("equity", 0)
 
-        # Profit total = somme des trades uniquement (pas le PnL flottant, pas les depots)
+        # Profit total = historique (trades fermés) + PnL flottant (positions ouvertes)
         # MT5's account_info().profit = PnL flottant (0 si aucune position ouverte)
         # Les deals de type 2 = BALANCE (depot FTMO) sont exclus
-        total_profit = 0.0
+        floating_profit = float(account.get("profit", 0))
+        total_profit = floating_profit
         try:
-            all_deals = mt5.history_deals_get(0, 2000000000)
+            # Utiliser datetime objects (pas d'entiers) pour fiabilite cross-version MT5
+            all_deals = mt5.history_deals_get(datetime(2000, 1, 1), datetime.now())
             if all_deals and len(all_deals) > 0:
                 trades = [d for d in all_deals if d.type in (0, 1)]
                 if trades:
-                    total_profit = round(
+                    hist_profit = round(
                         sum(float(d.profit) + float(d.swap) + float(d.commission) for d in trades),
                         2,
                     )
+                    total_profit = round(hist_profit + floating_profit, 2)
         except Exception as e:
             logger.warning(f"Erreur calcul profit total: {e}")
 
@@ -151,8 +154,8 @@ class AccountMonitor:
             return []
 
         if days is None:
-            # Tous les trades via position range (int) pour eviter les soucis de timezone
-            history = mt5.history_deals_get(0, 2000000000)
+            # Tous les trades via datetime objects (pas d'entiers, plus fiable cross-version)
+            history = mt5.history_deals_get(datetime(2000, 1, 1), datetime.now())
         else:
             since = datetime.now() - timedelta(days=days)
             history = mt5.history_deals_get(since, datetime.now())
