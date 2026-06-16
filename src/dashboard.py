@@ -892,6 +892,8 @@ def render_dashboard():
     # ─── Row 6: Proximité ICT (DataFrame) ──────────────────────────────────
     st.divider()
     st.subheader("📍 Proximité ICT")
+    # Préfixes cerclés pour que le tri alphabétique suive l'ordre hiérarchique ICT
+    _tf_sort_prefix = {tf: chr(0x2460 + i) for i, tf in enumerate(TIMEFRAME_HIERARCHY)}
     proximity = analysis.get("proximity", {})
     if proximity:
         order = ["OTE", "OB", "FVG", "GAP", "Discount", "Premium", "Equilibrium", "BSL", "SSL", "MSS"]
@@ -907,9 +909,10 @@ def render_dashboard():
                 continue
             for a in proximity[ctype][:2]:
                 icon = icons.get(ctype, "📍")
+                prefix = _tf_sort_prefix.get(a.tf, "")
                 rows.append({
                     "Concept": f"{icon} {ctype}",
-                    "TF": a.tf,
+                    "TF": f"{prefix} {a.tf}" if prefix else a.tf,
                     "Direction": dir_labels.get(a.direction, a.direction.upper()),
                     "Zone": f"{a.level_low:.1f} – {a.level_high:.1f}",
                     "Distance": a.distance_label(),
@@ -943,7 +946,12 @@ def render_dashboard():
         for s in setups:
             direction = "🟢 LONG" if s.direction == "long" else "🔴 SHORT"
             rr = s.risk_reward()
-            tfs_str = ', '.join(s.tfs) if s.tfs else ''
+            # Préfixer la première TF pour que le tri alphabétique suive l'ordre hiérarchique
+            if s.tfs:
+                prefix = _tf_sort_prefix.get(s.tfs[0], "")
+                tfs_str = f"{prefix} {', '.join(s.tfs)}" if prefix else ', '.join(s.tfs)
+            else:
+                tfs_str = ''
             tp2_str = f"{s.target_2:.1f}" if s.target_2 else "-"
             tp3_str = f"{s.target_3:.1f}" if s.target_3 else "-"
             rows.append({
@@ -985,7 +993,51 @@ def render_dashboard():
     else:
         st.info("Aucun setup de trading basé sur la proximité ICT.")
 
-    # ─── Row 8: Suivi des Setups (Tracker) ────────────────────────────
+    # ─── Row 8: Key Levels ────────────────────────────────────────────
+    st.divider()
+    st.subheader("🔑 Key Levels — Niveaux de Liquidité")
+    key_levels = analysis.get("key_levels", [])
+    if key_levels:
+        price_now = analysis.get("current_price", {}).get("bid", 0)
+        kl_rows = []
+        order_kl = ["PMH", "PML", "PWH", "PWL", "PDH", "PDL"]
+        for lt in order_kl:
+            for kl in key_levels:
+                if kl.level_type == lt:
+                    dist = price_now - kl.level
+                    liq_type = "🟢 BSL" if kl.liquidity_type == "BSL" else "🔴 SSL"
+                    status = "🔥 Sweepé" if kl.swept else "✅ Intact"
+                    status_color = "#ff4444" if kl.swept else "#00ff88"
+                    kl_rows.append({
+                        "Niveau": lt,
+                        "Label": kl.label,
+                        "Prix": f"{kl.level:.1f}",
+                        "Liquidité": liq_type,
+                        "TF": kl.source_tf,
+                        "Distance": f"{dist:+.1f}",
+                        "Statut": status,
+                    })
+
+        if kl_rows:
+            df_kl = pd.DataFrame(kl_rows)
+            st.dataframe(
+                df_kl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Niveau": st.column_config.TextColumn("🏔️ Niveau", width="small"),
+                    "Label": st.column_config.TextColumn("📝 Description", width="medium"),
+                    "Prix": st.column_config.TextColumn("💰 Prix", width="small"),
+                    "Liquidité": st.column_config.TextColumn("🎯 Type", width="small"),
+                    "TF": st.column_config.TextColumn("📡 TF", width="small"),
+                    "Distance": st.column_config.TextColumn("📏 Distance", width="small"),
+                    "Statut": st.column_config.TextColumn("🔒 Statut", width="small"),
+                },
+            )
+    else:
+        st.info("Aucun key level détecté. Active les timeframes D1, W1 ou MN1.")
+
+    # ─── Row 9: Suivi des Setups (Tracker) ────────────────────────────
     st.divider()
     st.subheader("📊 Suivi des Setups de Trading")
 

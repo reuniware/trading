@@ -52,7 +52,7 @@ trading/
 
 ## ✨ Fonctionnalités
 
-### 📊 Analyse Multi-Timeframes (8 timeframes)
+### 📊 Analyse Multi-Timeframes (9 timeframes)
 | Timeframe | Échelle | Usage |
 |-----------|---------|-------|
 | **MN1** | Mensuel | Vision macro / tendance long terme |
@@ -60,6 +60,7 @@ trading/
 | **D1** | Daily | Bias quotidien |
 | **H4** | 4 heures | Cadre opérationnel MT |
 | **H1** | 1 heure | Point d'entrée CT |
+| **M30** | 30 minutes | Exécution intermédiaire |
 | **M15** | 15 minutes | Exécution |
 | **M5** | 5 minutes | Micro-exécution |
 | **M1** | 1 minute | Scalping |
@@ -80,13 +81,20 @@ trading/
 - **Liquidity confluence** : Bonus pour plusieurs BSL/SSL proches
 - **Kill Zones bonus** : Session active / Silver Bullet (max +12 pts)
 - **Conflit TF malus** : Détection de conflits directionnels (−10 pts)
+- **Seuil minimum : 45** — les signaux faibles (< 45) sont filtrés
 - **Normalisation** : Score final entre 0 et 100
+
+### 📍 SL/TP ICT pur
+- **SL au niveau réel** du concept (OB low, FVG low, OTE fib_50, SSL, Premium high) — plus de buffer `pd_range * 0.15`
+- **TP vers le prochain niveau de liquidité** (BSL pour LONG, SSL pour SHORT) — plus de Fibonacci
+- **SignalGenerator** et **ProximityAnalyzer** utilisent la même logique ICT
+- **Filtre R:R minimum** : setups avec R:R < 2.0 automatiquement écartés
 
 ### 🗂️ Suivi des Setups (Setup Tracker)
 - **Tracking automatique** — chaque setup détecté est loggé avec entrée/SL/TP
 - **Vérification continue** — TP1/TP2/TP3 touché ou SL = résultat enregistré
-- **Anti-résolution instantanée** — délai minimum de 60s avant qu'un setup puisse être résolu (évite les losses sur le même tick de création)
-- **Vrais High/Low OHLC** — la vérification utilise les bougies M1/M5/M15 au lieu des ticks bid/ask instantanés
+- **Anti-résolution instantanée** — délai minimum de **180s** avant résolution (évite les wicks intrabar)
+- **Vrais High/Low OHLC** — utilise les bougies **M5 complétées** (`iloc[-2]`) au lieu des bougies en formation ou ticks bid/ask
 - **Dédoublonnage robuste** — correction du bug d'indentation qui empêchait la détection des doublons
 - **Stats en direct** — Win rate, R:R moyen, par direction LONG/SHORT (cartes métriques séparées), par source (signal/proximity)
 - **Âge & Expiration** — chaque setup affiche son temps de vie (Âge) et le temps restant avant expiration (7j max)
@@ -118,7 +126,7 @@ trading/
 ### 📈 Dashboard temps réel (Streamlit)
 - Graphique bougies avec OB/FVG superposés
 - Prix Bid/Ask en direct
-- Signaux LONG/SHORT avec TP Fibonacci (1.272/1.414/1.618)
+- Signaux LONG/SHORT avec SL/TP ICT purs
 - Positions ouvertes avec gestion
 - Performance 30 jours + Totale
 - Courbe d'equity
@@ -126,7 +134,8 @@ trading/
 - **⏱️ Timeframes sélectionnables** : cases à cocher dans la sidebar pour filtrer les TFs analysés — **persistance via URL** (survit au F5)
 - **🕐 Sessions et Silver Bullet** : badges avec décomptes ouverture/fermeture, animation pulse orange
 - **📊 Bannière Macro ICT** : contexte global (Haussière/Baissière/Neutre) + zone de prix + killzone active + conformité killzone
-- **📍 Proximité ICT** : tableau DataFrame structuré (Concept, TF, Direction, Zone, Distance, Force)
+- **📍 Proximité ICT** : tableau DataFrame structuré (Concept, TF, Direction, Zone, Distance, Force) — **tri hiérarchique** par TF
+- **🔑 Key Levels** : PDH/PDL/PWH/PWL/PMH/PML affichés avec statut (sweepé/intact), distance, type de liquidité
 - **🎯 Setups de trading** : tableau DataFrame complet (Direction, Force, R:R, TFs, Entrée, SL, TP1-3, Raisons)
 - **📊 Suivi des Setups** : stats globales (win rate, R:R), **cartes LONG/SHORT séparées** avec win rate coloré, par source, tableau des actifs avec Âge, Progrès (code couleur), R:R et Expire
 - **🔫 Conformité Killzone** : comportement attendu vs observé, score, alertes
@@ -264,8 +273,9 @@ Détection des sessions de trading + conformité killzone :
 Génération de signaux avec scoring ICT pur :
 - Confluence multi-TF pondérée par hiérarchie
 - Zone d'entrée = OB/FVG le plus proche du prix
-- SL sous l'OB / au-dessus du FVG
-- TP Fibonacci 1.272 / 1.414 / 1.618
+- SL au niveau réel de l'OB/FVG ($0.50 spread offset) — plus de buffer
+- TP vers le prochain niveau de liquidité (BSL pour LONG, SSL pour SHORT) — plus de Fibonacci
+- Score minimum : **45** (filtre les signaux faibles)
 
 ### `src/trade_manager.py`
 Exécution d'ordres MT5 :
@@ -291,12 +301,16 @@ Monitoring du compte :
 ### `src/proximity.py`
 Analyse de proximité du prix avec les concepts ICT :
 - Détection des OB, FVG, OTE, Discount/Premium, BSL/SSL, MSS proches du prix
-- **Key Levels** : PDH/PDL/PWH/PWL comme alertes de proximité
+- **Key Levels** : PDH/PDL/PWH/PWL/PWH/PMH/PML comme alertes de proximité
 - **Sweep alerts** : signaux de sweep intégrés comme alertes prioritaires
 - Filtre adaptatif basé sur le PD Array range
-- Génération de **setups LONG/SHORT** avec SL et TP
+- Génération de **setups LONG/SHORT** avec SL et TP ICT purs :
+  - **SL au niveau réel du concept** (OB low, FVG low, Discount low, SSL) + $0.50 spread
+  - **TP vers le prochain BSL/SSL** (liquidité réelle), pas de Fibonacci
+  - Priorité : OTE > Discount > OB > FVG > SSL pour LONG, Premium > OB > FVG > BSL pour SHORT
   - **Sweep setups** : entrées basées sur les sweeps de niveaux clés (prioritaires)
   - **Key level setups** : entrées basées sur la proximité BSL/SSL
+- Filtre R:R minimum (≥ 2.0 via config)
 - R:R calculé automatiquement
 - **Raisons détaillées** : pourquoi l'entrée, pourquoi le SL à ce niveau, pourquoi le TP
 

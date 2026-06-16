@@ -234,16 +234,16 @@ class SignalGenerator:
         current_price = self._get_current_price(data)
         pd_range = self._get_pd_array_range(data)
         
-        if current_price > 0 and score >= 20:
+        if current_price > 0 and score >= 45:
             entry_low, entry_high = self._calculate_entry_zone(
                 direction, concepts_found, current_price, pd_range
             )
             
-            # Targets ICT (Fibonacci 1.272 / 1.414 / 1.618)
-            sl, tp1, tp2, tp3 = self._execute_fib_targets(
-                direction, entry_low, entry_high, current_price, data, concepts_found
+            # Targets ICT (SL au niveau réel de l'OB/FVG, TP vers BSL/SSL)
+            sl, tp1, tp2, tp3 = self._execute_ict_targets(
+                direction, entry_low, entry_high, current_price, concepts_found, key_levels
             )
-            if sl != 0:
+            if sl != 0 and tp1 != 0:
                 stop = sl
                 targets = [tp1, tp2, tp3, sl]
         
@@ -254,15 +254,18 @@ class SignalGenerator:
         elif score >= 35:
             confidence = "medium"
 
-        if score < 15:
+        if score < 45:
             return None
 
-        # Fallback: si pas de zone d'entree, utiliser le dernier prix
+        # Pas de SL/TP valide → pas de signal
+        if stop == 0:
+            return None
+
+        # Fallback: si pas de zone d'entree, utiliser le dernier prix ±$1
         if entry_low == 0 or entry_high == 0:
             if current_price > 0:
-                buffer = pd_range * 0.15 if pd_range > 0 else 10.0
-                entry_low = current_price - buffer
-                entry_high = current_price + buffer
+                entry_low = current_price - 1.0
+                entry_high = current_price + 1.0
 
         return TradeSignal(
             symbol=symbol,
@@ -378,26 +381,20 @@ class SignalGenerator:
         
         return entry_low, entry_high
 
-    def _execute_fib_targets(
+    def _execute_ict_targets(
         self, direction: str, entry_low: float, entry_high: float,
-        current_price: float, data: Dict, concepts_found: Dict
+        current_price: float, concepts_found: Dict,
+        key_levels: Optional[List[KeyLevel]] = None,
     ) -> Tuple[float, float, float, float]:
         """
-        Calcule SL et TP avec Fibonacci ICT (1.272 / 1.414 / 1.618).
-        
-        ICT pur:
-        - Utilise l'OB/PD Array du TF d'execution (M15, M5) pour les targets
-        - SL sous le LOW de l'OB pour LONG / au-dessus du HIGH pour SHORT
-        - TP1 : 1.272 fib extension du PD Array range
-        - TP2 : 1.414 fib extension
-        - TP3 : 1.618 fib extension
-        
-        IMPORTANT: prend le concept du TF d'execution (M15/M5/H1) pour les targets,
-        pas le plus fort (qui peut etre MN1/W1 et donner des ranges absurdes).
+        Calcule SL et TP selon la méthodologie ICT pure :
+        - SL au niveau réel de l'OB/FVG du TF d'exécution (pas de buffer)
+        - TP vers le prochain niveau de liquidité (BSL pour LONG, SSL pour SHORT)
+        - Pas de Fibonacci
         """
         sl, tp1, tp2, tp3 = 0.0, 0.0, 0.0, 0.0
-        
-        # Chercher l'OB du TF d'execution (M15, M5, H1) pour les targets
+
+        # Chercher l'OB/FVG du TF d'execution (M15, M5, H1)
         exec_tfs = ["M15", "M5", "H1"]
         ob_concept = None
         for tf in exec_tfs:
@@ -405,8 +402,7 @@ class SignalGenerator:
             if ob_key in concepts_found and hasattr(concepts_found[ob_key], 'low'):
                 ob_concept = concepts_found[ob_key]
                 break
-        
-        # Si pas d'OB, chercher le FVG du TF d'execution
+
         fvg_concept = None
         if not ob_concept:
             for tf in exec_tfs:
@@ -414,56 +410,69 @@ class SignalGenerator:
                 if fvg_key in concepts_found and hasattr(concepts_found[fvg_key], 'lower'):
                     fvg_concept = concepts_found[fvg_key]
                     break
-        
-        # Utiliser le PD Array range (10 bougies M15) comme base Fibonacci
-        pd_range = self._get_pd_array_range(data)
-        
-        if ob_concept:
-            # SL base sur l'OB du TF d'execution (zone serree)
-            ob_range = abs(ob_concept.high - ob_concept.low)
-            small_buffer = ob_range * 0.2 if ob_range > 0 else pd_range * 0.1
-            
-            if direction == "buy":
-                sl = ob_concept.low - small_buffer
-                tp1 = current_price + pd_range * 1.272
-                tp2 = current_price + pd_range * 1.414
-                tp3 = current_price + pd_range * 1.618
+
+        if not ob_concept and not fvg_concept:
+            return 0.0, 0.0, 0.0, 0.0
+
+        # ── SL : au niveau réel du concept + spread offset ($0.50) ──
+        if direction == "buy":
+            if ob_concept:
+                sl = ob_concept.low - 0.5
             else:
-                sl = ob_concept.high + small_buffer
-                tp1 = current_price - pd_range * 1.272
-                tp2 = current_price - pd_range * 1.414
-                tp3 = current_price - pd_range * 1.618
-        elif fvg_concept:
-            # SL base sur le FVG
-            fvg_range = abs(fvg_concept.upper - fvg_concept.lower)
-            small_buffer = fvg_range * 0.2 if fvg_range > 0 else pd_range * 0.1
-            
-            if direction == "buy":
-                sl = fvg_concept.lower - small_buffer
-                tp1 = current_price + pd_range * 1.272
-                tp2 = current_price + pd_range * 1.414
-                tp3 = current_price + pd_range * 1.618
-            else:
-                sl = fvg_concept.upper + small_buffer
-                tp1 = current_price - pd_range * 1.272
-                tp2 = current_price - pd_range * 1.414
-                tp3 = current_price - pd_range * 1.618
+                sl = fvg_concept.lower - 0.5
         else:
-            # Fallback: PD Array range
-            if pd_range > 0:
-                if direction == "buy":
-                    sl = current_price - pd_range * 0.5
-                    tp1 = current_price + pd_range * 1.272
-                    tp2 = current_price + pd_range * 1.414
-                    tp3 = current_price + pd_range * 1.618
-                else:
-                    sl = current_price + pd_range * 0.5
-                    tp1 = current_price - pd_range * 1.272
-                    tp2 = current_price - pd_range * 1.414
-                    tp3 = current_price - pd_range * 1.618
+            if ob_concept:
+                sl = ob_concept.high + 0.5
             else:
-                return 0.0, 0.0, 0.0, 0.0
-        
+                sl = fvg_concept.upper + 0.5
+
+        # ── TP : prochain niveau de liquidité (BSL/SSL) ──
+        if key_levels:
+            if direction == "buy":
+                bsl_levels = [kl for kl in key_levels
+                             if kl.liquidity_type == "BSL" and not kl.swept and kl.level > current_price]
+                bsl_levels.sort(key=lambda k: k.level - current_price)
+                for bsl in bsl_levels[:3]:
+                    if tp1 == 0:
+                        tp1 = bsl.level
+                    elif tp2 == 0:
+                        tp2 = bsl.level
+                    elif tp3 == 0:
+                        tp3 = bsl.level
+            else:
+                ssl_levels = [kl for kl in key_levels
+                             if kl.liquidity_type == "SSL" and not kl.swept and kl.level < current_price]
+                ssl_levels.sort(key=lambda k: current_price - k.level)
+                for ssl in ssl_levels[:3]:
+                    if tp1 == 0:
+                        tp1 = ssl.level
+                    elif tp2 == 0:
+                        tp2 = ssl.level
+                    elif tp3 == 0:
+                        tp3 = ssl.level
+
+        # Fallback si pas de key levels : OB/FVG direction opposée
+        if tp1 == 0:
+            opposite_levels = []
+            for key, concept in concepts_found.items():
+                if "ob_" in key and hasattr(concept, 'type'):
+                    if direction == "buy" and concept.type == "bearish" and hasattr(concept, 'low'):
+                        opposite_levels.append(concept.low)
+                    elif direction == "sell" and concept.type == "bullish" and hasattr(concept, 'high'):
+                        opposite_levels.append(concept.high)
+                elif "fvg_" in key and hasattr(concept, 'type'):
+                    if direction == "buy" and concept.type == "bearish" and hasattr(concept, 'lower'):
+                        opposite_levels.append(concept.lower)
+                    elif direction == "sell" and concept.type == "bullish" and hasattr(concept, 'upper'):
+                        opposite_levels.append(concept.upper)
+
+            if opposite_levels:
+                if direction == "buy":
+                    opposite_levels.sort()
+                else:
+                    opposite_levels.sort(reverse=True)
+                tp1 = opposite_levels[0]
+
         return sl, tp1, tp2, tp3
 
     def _get_execution_tf(self, direction: str, analysis: Dict) -> str:

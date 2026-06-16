@@ -16,6 +16,7 @@ TIMEFRAMES = {
     "D1":  mt5.TIMEFRAME_D1,
     "H4":  mt5.TIMEFRAME_H4,
     "H1":  mt5.TIMEFRAME_H1,
+    "M30": mt5.TIMEFRAME_M30,
     "M15": mt5.TIMEFRAME_M15,
     "M5":  mt5.TIMEFRAME_M5,
     "M1":  mt5.TIMEFRAME_M1,
@@ -24,7 +25,7 @@ TIMEFRAMES = {
 TIMEFRAME_NAMES = list(TIMEFRAMES.keys())
 
 # Ordre hiérarchique (du plus haut au plus bas)
-TIMEFRAME_HIERARCHY = ["MN1", "W1", "D1", "H4", "H1", "M15", "M5", "M1"]
+TIMEFRAME_HIERARCHY = ["MN1", "W1", "D1", "H4", "H1", "M30", "M15", "M5", "M1"]
 
 # Mapping des noms lisibles
 TIMEFRAME_LABELS = {
@@ -33,6 +34,7 @@ TIMEFRAME_LABELS = {
     "D1":  "Daily",
     "H4":  "4H",
     "H1":  "1H",
+    "M30": "30M",
     "M15": "15M",
     "M5":  "5M",
     "M1":  "1M",
@@ -45,6 +47,7 @@ TIMEFRAME_BARS = {
     "D1":  365,
     "H4":  500,
     "H1":  500,
+    "M30": 500,
     "M15": 500,
     "M5":  500,
     "M1":  200,

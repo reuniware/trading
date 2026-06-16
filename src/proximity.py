@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .config import TIMEFRAME_LABELS
+from .config import TIMEFRAME_LABELS, RISK
 from .ict_concepts import (
     OrderBlock, FairValueGap, MarketStructureShift,
     LiquidityLevel, DiscountPremium, PriceGap, KeyLevel, SweepSignal,
@@ -565,7 +565,7 @@ class PriceProximityAnalyzer:
             for ss in sweep_signals:
                 if not ss.confirmation:
                     continue
-                setup = self._build_sweep_setup(ss, alerts, analysis, current_price)
+                setup = self._build_sweep_setup(ss, alerts, analysis, current_price, key_levels)
                 if setup:
                     setups.append(setup)
 
@@ -588,7 +588,7 @@ class PriceProximityAnalyzer:
                     bias_short_tfs += 1
 
         # --- SETUP LONG ---
-        setup_long = self._build_long_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs)
+        setup_long = self._build_long_setup(alerts, analysis, current_price, bias_long_tfs, bias_short_tfs, key_levels)
         if setup_long:
             setups.append(setup_long)
 
@@ -606,6 +606,10 @@ class PriceProximityAnalyzer:
             if kl_short:
                 setups.append(kl_short)
 
+        # R:R minimum (configurable dans RiskConfig)
+        min_rr = RISK.min_r_multiple
+        setups = [s for s in setups if s.risk_reward() >= min_rr]
+
         setups.sort(key=lambda s: s.strength, reverse=True)
         return setups
 
@@ -617,12 +621,12 @@ class PriceProximityAnalyzer:
         bias_short: int,
         key_levels: Optional[List[KeyLevel]] = None,
     ) -> Optional[ProximitySetup]:
-        """Construit un setup LONG si les conditions sont réunies."""
-        # Conditions pour LONG :
-        # 1. Prix dans Discount zone OU OTE OU proche d'un OB haussier OU SSL
-        # 2. Un SL peut être placé en dessous
-        # 3. Un TP peut être placé au-dessus
-
+        """
+        Construit un setup LONG selon la méthodologie ICT :
+        - SL au niveau réel du support (bas de l'OB, bas du FVG, fib_50 OTE, Discount low, SSL)
+        - TP au prochain niveau de liquidité haussière (BSL : PDH > PWH > PMH)
+        - Pas de buffer arbitraire ni d'extension Fibonacci
+        """
         has_discount = "Discount" in alerts and any(a.is_entry_zone for a in alerts["Discount"])
         has_ote = "OTE" in alerts and any(a.is_entry_zone for a in alerts["OTE"])
         has_bullish_ob = "OB" in alerts and any(
@@ -636,124 +640,179 @@ class PriceProximityAnalyzer:
             for a in alerts["SSL"]
         )
 
-        # Au moins une condition haussière remplie
         if not (has_discount or has_ote or has_bullish_ob or has_bullish_fvg or has_ssl_near):
             return None
 
-        # Collecter les niveaux pour le calcul SL/TP
-        # IMPORTANT: seuls les supports PROCHES du prix (dans 2*PD range) sont retenus
-        max_support_dist = self.pd_range * 2.0
-        support_levels = []  # Niveaux sous le prix (pour SL)
-        support_details = []  # Détails des supports retenus
+        # ── Déterminer le concept principal (priorité ICT) + niveaux ──
+        sl_price = None
+        sl_reason = ""
+        entry_low = price
+        entry_high = price
         concepts_used = []
         tfs_used = set()
         strength_sum = 0.0
         count = 0
 
-        for ctype in ["OB", "FVG", "Discount", "OTE", "SSL"]:
-            if ctype not in alerts:
-                continue
-            for a in alerts[ctype]:
-                # Concepts haussiers ou en zone
-                if a.direction in ("bullish", "neutral") or a.is_entry_zone:
-                    near_dist = abs(a.price_distance) if not a.is_entry_zone else abs(price - a.level_low)
-                    if near_dist < max_support_dist or a.is_entry_zone:
-                        support_levels.append(a.level_low)
-                        if a.level_high > a.level_low:
-                            support_levels.append(a.level_high)
-                        support_details.append(f"{ctype} {a.tf} ({a.level_low:.1f}-{a.level_high:.1f})")
-                    concepts_used.append(ctype)
-                    tfs_used.add(a.tf)
-                    count += 1
-                    strength_sum += a.strength * (2.0 if a.is_entry_zone else 1.0)
+        # 1) OTE (Optimal Trade Entry) — prioritaire
+        if has_ote:
+            best_ote = None
+            for a in alerts.get("OTE", []):
+                if a.is_entry_zone:
+                    if best_ote is None or a.strength > best_ote.strength:
+                        best_ote = a
+            if best_ote:
+                sl_price = best_ote.level_low - 0.5  # 1 pip sous la zone OTE
+                entry_low = best_ote.level_low
+                entry_high = best_ote.level_high
+                sl_reason = f"SL sous zone OTE ({best_ote.level_low:.1f})"
+                concepts_used.append("OTE")
+                tfs_used.add(best_ote.tf)
+                strength_sum += best_ote.strength * 2.0
+                count += 1
 
-        # Chercher des résistances (bearish OB/FVG) dans l'analyse complète
-        res_high = 0.0
-        res_detail = ""
-        for tf_name, result in analysis.items():
-            for ob in result.get("order_blocks", []):
-                if ob.type == "bearish" and ob.low > price:
-                    if res_high == 0 or ob.low < res_high:
-                        res_high = ob.low
-                        res_detail = f"OB baissier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({ob.low:.1f})"
-            for fvg in result.get("fvgs", []):
-                if fvg.type == "bearish" and fvg.lower > price:
-                    if res_high == 0 or fvg.lower < res_high:
-                        res_high = fvg.lower
-                        res_detail = f"FVG baissier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({fvg.lower:.1f})"
+        # 2) Zone Discount
+        elif has_discount:
+            best_disc = None
+            for a in alerts.get("Discount", []):
+                if a.is_entry_zone:
+                    if best_disc is None or a.strength > best_disc.strength:
+                        best_disc = a
+            if best_disc:
+                sl_price = best_disc.level_low - 0.5  # sous la zone Discount
+                entry_low = best_disc.level_low
+                entry_high = best_disc.level_high
+                sl_reason = f"SL sous zone Discount ({best_disc.level_low:.1f})"
+                concepts_used.append("Discount")
+                tfs_used.add(best_disc.tf)
+                strength_sum += best_disc.strength * 2.0
+                count += 1
 
-        if count == 0 or not support_levels:
+        # 3) Order Block haussier
+        elif has_bullish_ob:
+            best_ob = None
+            for a in alerts.get("OB", []):
+                if a.is_entry_zone and a.direction == "bullish":
+                    if best_ob is None or a.strength > best_ob.strength:
+                        best_ob = a
+            if best_ob:
+                sl_price = best_ob.level_low - 0.5  # sous l'OB
+                entry_low = best_ob.level_low
+                entry_high = best_ob.level_high
+                sl_reason = f"SL sous OB haussier ({best_ob.level_low:.1f})"
+                concepts_used.append("OB")
+                tfs_used.add(best_ob.tf)
+                strength_sum += best_ob.strength * 2.0
+                count += 1
+
+        # 4) FVG haussier
+        elif has_bullish_fvg:
+            best_fvg = None
+            for a in alerts.get("FVG", []):
+                if a.is_entry_zone and a.direction == "bullish":
+                    if best_fvg is None or a.strength > best_fvg.strength:
+                        best_fvg = a
+            if best_fvg:
+                sl_price = best_fvg.level_low - 0.5  # sous le FVG
+                entry_low = best_fvg.level_low
+                entry_high = best_fvg.level_high
+                sl_reason = f"SL sous FVG haussier ({best_fvg.level_low:.1f})"
+                concepts_used.append("FVG")
+                tfs_used.add(best_fvg.tf)
+                strength_sum += best_fvg.strength * 2.0
+                count += 1
+
+        # 5) SSL (sell-side liquidity attractive)
+        elif has_ssl_near:
+            best_ssl = None
+            for a in alerts.get("SSL", []):
+                if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5:
+                    if best_ssl is None or a.strength > best_ssl.strength:
+                        best_ssl = a
+            if best_ssl:
+                sl_price = best_ssl.level_low - 0.5
+                sl_reason = f"SL sous SSL ({best_ssl.level_low:.1f})"
+                concepts_used.append("SSL")
+                tfs_used.add(best_ssl.tf)
+                strength_sum += best_ssl.strength
+                count += 1
+
+        if sl_price is None or count == 0:
             return None
 
-        # Calcul SL : sous le support le plus proche du prix
-        support_levels.sort()
-        nearest_support = [s for s in support_levels if s < price]
-        if nearest_support:
-            sl_base = max(nearest_support)
-        else:
-            sl_base = min(support_levels)
-        sl_price = sl_base - self.pd_range * 0.15
-
-        # Raison SL
-        sl_buffer = self.pd_range * 0.15
-        sl_reason_parts = []
-        for d in support_details:
-            if str(sl_base) in d or f"{sl_base:.1f}" in d:
-                sl_reason_parts.append(d)
-        if sl_reason_parts:
-            sl_reason = f"SL sous {sl_reason_parts[0]} (support + buffer {sl_buffer:.1f}$)"
-        else:
-            sl_reason = f"SL à {sl_price:.1f}$ sous le support le plus proche ({sl_base:.1f}) + buffer {sl_buffer:.1f}$"
-
-        # Calcul TP : vers la résistance la plus proche, ou Fibonacci 1.272
-        use_fib = True
-        if res_high > 0 and res_high - price > self.pd_range * 0.3:
-            tp1 = res_high
-            tp2 = price + self.pd_range * 1.272
-            tp3 = price + self.pd_range * 1.618
-            use_fib = False
-        else:
-            tp1 = price + self.pd_range * 1.272
-            tp2 = price + self.pd_range * 1.618
-            tp3 = None
-
-        # Raison TP
-        if use_fib:
-            fib_range = self.pd_range
-            tp_reason = f"Extension Fibonacci 1.272× PD range ({fib_range:.1f}$) → {tp1:.1f}$"
-        else:
-            tp_reason = f"Prochaine résistance : {res_detail}"
-
-        # Zone d'entrée : +/- 5% du PD range
-        entry_low = price - self.pd_range * 0.05
-        entry_high = price + self.pd_range * 0.05
-
-        # Raison entrée avec TFs
+        # ── TP : prochain niveau BSL (buy-side liquidity) ──
+        tp1, tp2, tp3 = None, None, None
+        tp_reason = ""
         entry_parts = []
+
+        if key_levels:
+            # BSL = PDH, PWH, PMH non sweepés au-dessus du prix
+            bsl_levels = [kl for kl in key_levels
+                         if kl.liquidity_type == "BSL" and not kl.swept and kl.level > price]
+            bsl_levels.sort(key=lambda k: k.level - price)
+
+            bsl_used = []
+            for bsl in bsl_levels[:3]:
+                bsl_used.append(f"{bsl.level_type} ({bsl.level:.1f})")
+                if tp1 is None:
+                    tp1 = bsl.level
+                elif tp2 is None:
+                    tp2 = bsl.level
+                elif tp3 is None:
+                    tp3 = bsl.level
+
+            if bsl_used:
+                tp_reason = " → ".join(bsl_used)
+
+        # Fallback : bearish OB/FVG au-dessus
+        if tp1 is None:
+            bearish_levels = []
+            for tf_name, result in analysis.items():
+                for ob in result.get("order_blocks", []):
+                    if ob.type == "bearish" and ob.low > price:
+                        bearish_levels.append((ob.low, f"OB {TIMEFRAME_LABELS.get(tf_name, tf_name)}"))
+                for fvg in result.get("fvgs", []):
+                    if fvg.type == "bearish" and fvg.lower > price:
+                        bearish_levels.append((fvg.lower, f"FVG {TIMEFRAME_LABELS.get(tf_name, tf_name)}"))
+
+            bearish_levels.sort(key=lambda x: x[0] - price)
+            if bearish_levels:
+                tp1 = bearish_levels[0][0]
+                parts = [f"{bearish_levels[0][1]} ({tp1:.1f})"]
+                if len(bearish_levels) > 1:
+                    tp2 = bearish_levels[1][0]
+                    parts.append(f"{bearish_levels[1][1]} ({tp2:.1f})")
+                if len(bearish_levels) > 2:
+                    tp3 = bearish_levels[2][0]
+                    parts.append(f"{bearish_levels[2][1]} ({tp3:.1f})")
+                tp_reason = " → ".join(parts)
+
+        if tp1 is None:
+            return None  # Pas de TP identifiable → pas de setup
+
+        # ── Raison d'entrée ──
         if has_ote:
-            tfs = sorted(set(a.tf for a in alerts.get("OTE", []) if a.is_entry_zone))
-            entry_parts.append(f"zone OTE ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("OTE", []) if a.is_entry_zone))
+            entry_parts.append(f"zone OTE ({', '.join(tfs_label)})")
         if has_discount:
-            tfs = sorted(set(a.tf for a in alerts.get("Discount", []) if a.is_entry_zone))
-            entry_parts.append(f"zone Discount ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("Discount", []) if a.is_entry_zone))
+            entry_parts.append(f"zone Discount ({', '.join(tfs_label)})")
         if has_bullish_ob:
-            tfs = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bullish"))
-            entry_parts.append(f"OB haussier ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bullish"))
+            entry_parts.append(f"OB haussier ({', '.join(tfs_label)})")
         if has_bullish_fvg:
-            tfs = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bullish"))
-            entry_parts.append(f"FVG haussier ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bullish"))
+            entry_parts.append(f"FVG haussier ({', '.join(tfs_label)})")
         if has_ssl_near:
-            tfs = sorted(set(a.tf for a in alerts.get("SSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
-            entry_parts.append(f"proximité SSL ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("SSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
+            entry_parts.append(f"proximité SSL ({', '.join(tfs_label)})")
+
         htf_str = "favorable" if bias_long > bias_short else "neutre"
         entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
 
         # Force du setup
-        avg_strength = strength_sum / count if count > 0 else 0.0
         has_htf_bias = bias_long > bias_short
-        strength = min(avg_strength * 0.5 + (0.3 if has_discount or has_ote else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
-
-        reason_parts = entry_parts.copy()
+        avg_strength = strength_sum / count if count > 0 else 0.0
+        strength = min(avg_strength * 0.6 + (0.2 if has_discount or has_ote else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
 
         return ProximitySetup(
             direction="long",
@@ -764,7 +823,7 @@ class PriceProximityAnalyzer:
             target_2=round(tp2, 1) if tp2 else None,
             target_3=round(tp3, 1) if tp3 else None,
             strength=round(strength, 2),
-            reason=f"Entrée LONG possible — {" + ".join(reason_parts)} — Bias HTF {'favorable' if has_htf_bias else 'neutre'}",
+            reason=f"Entrée LONG — {' + '.join(entry_parts)} → TP: {tp_reason}",
             entry_reason=entry_reason,
             sl_reason=sl_reason,
             tp_reason=tp_reason,
@@ -780,7 +839,12 @@ class PriceProximityAnalyzer:
         bias_short: int,
         key_levels: Optional[List[KeyLevel]] = None,
     ) -> Optional[ProximitySetup]:
-        """Construit un setup SHORT si les conditions sont réunies."""
+        """
+        Construit un setup SHORT selon la méthodologie ICT :
+        - SL au niveau réel de la résistance (haut de l'OB, haut du FVG, Premium high, BSL)
+        - TP au prochain niveau de liquidité baissière (SSL : PDL > PWL > PML)
+        - Pas de buffer arbitraire ni d'extension Fibonacci
+        """
         has_premium = "Premium" in alerts and any(a.is_entry_zone for a in alerts["Premium"])
         has_bearish_ob = "OB" in alerts and any(
             a.is_entry_zone and a.direction == "bearish" for a in alerts["OB"]
@@ -796,110 +860,156 @@ class PriceProximityAnalyzer:
         if not (has_premium or has_bearish_ob or has_bearish_fvg or has_bsl_near):
             return None
 
-        resistance_levels = []
-        resistance_details = []
-        max_res_dist = self.pd_range * 2.0
+        # ── Déterminer le concept principal (priorité ICT) + niveaux ──
+        sl_price = None
+        sl_reason = ""
+        entry_low = price
+        entry_high = price
         concepts_used = []
         tfs_used = set()
         strength_sum = 0.0
         count = 0
 
-        for ctype in ["OB", "FVG", "Premium", "BSL"]:
-            if ctype not in alerts:
-                continue
-            for a in alerts[ctype]:
-                if a.direction in ("bearish", "neutral") or a.is_entry_zone:
-                    near_dist = abs(a.price_distance) if not a.is_entry_zone else abs(a.level_high - price)
-                    if near_dist < max_res_dist or a.is_entry_zone:
-                        resistance_levels.append(a.level_high)
-                        resistance_details.append(f"{ctype} {a.tf} ({a.level_low:.1f}-{a.level_high:.1f})")
-                    concepts_used.append(ctype)
-                    tfs_used.add(a.tf)
-                    count += 1
-                    strength_sum += a.strength * (2.0 if a.is_entry_zone else 1.0)
+        # 1) Zone Premium — prioritaire
+        if has_premium:
+            best_prem = None
+            for a in alerts.get("Premium", []):
+                if a.is_entry_zone:
+                    if best_prem is None or a.strength > best_prem.strength:
+                        best_prem = a
+            if best_prem:
+                sl_price = best_prem.level_high + 0.5  # 1 pip au-dessus de la zone Premium
+                entry_low = best_prem.level_low
+                entry_high = best_prem.level_high
+                sl_reason = f"SL au-dessus zone Premium ({best_prem.level_high:.1f})"
+                concepts_used.append("Premium")
+                tfs_used.add(best_prem.tf)
+                strength_sum += best_prem.strength * 2.0
+                count += 1
 
-        # Chercher des supports (bullish OB/FVG) dans l'analyse complète
-        sup_low = 0.0
-        sup_detail = ""
-        for tf_name, result in analysis.items():
-            for ob in result.get("order_blocks", []):
-                if ob.type == "bullish" and ob.high < price:
-                    if sup_low == 0 or ob.high > sup_low:
-                        sup_low = ob.high
-                        sup_detail = f"OB haussier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({ob.high:.1f})"
-            for fvg in result.get("fvgs", []):
-                if fvg.type == "bullish" and fvg.upper < price:
-                    if sup_low == 0 or fvg.upper > sup_low:
-                        sup_low = fvg.upper
-                        sup_detail = f"FVG haussier {TIMEFRAME_LABELS.get(tf_name, tf_name)} ({fvg.upper:.1f})"
+        # 2) Order Block baissier
+        elif has_bearish_ob:
+            best_ob = None
+            for a in alerts.get("OB", []):
+                if a.is_entry_zone and a.direction == "bearish":
+                    if best_ob is None or a.strength > best_ob.strength:
+                        best_ob = a
+            if best_ob:
+                sl_price = best_ob.level_high + 0.5  # au-dessus de l'OB
+                entry_low = best_ob.level_low
+                entry_high = best_ob.level_high
+                sl_reason = f"SL au-dessus OB baissier ({best_ob.level_high:.1f})"
+                concepts_used.append("OB")
+                tfs_used.add(best_ob.tf)
+                strength_sum += best_ob.strength * 2.0
+                count += 1
 
-        if count == 0 or not resistance_levels:
+        # 3) FVG baissier
+        elif has_bearish_fvg:
+            best_fvg = None
+            for a in alerts.get("FVG", []):
+                if a.is_entry_zone and a.direction == "bearish":
+                    if best_fvg is None or a.strength > best_fvg.strength:
+                        best_fvg = a
+            if best_fvg:
+                sl_price = best_fvg.level_high + 0.5  # au-dessus du FVG
+                entry_low = best_fvg.level_low
+                entry_high = best_fvg.level_high
+                sl_reason = f"SL au-dessus FVG baissier ({best_fvg.level_high:.1f})"
+                concepts_used.append("FVG")
+                tfs_used.add(best_fvg.tf)
+                strength_sum += best_fvg.strength * 2.0
+                count += 1
+
+        # 4) BSL (buy-side liquidity attractive)
+        elif has_bsl_near:
+            best_bsl = None
+            for a in alerts.get("BSL", []):
+                if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5:
+                    if best_bsl is None or a.strength > best_bsl.strength:
+                        best_bsl = a
+            if best_bsl:
+                sl_price = best_bsl.level_low + 0.5  # Note: level_low == level_high pour un point unique
+                sl_reason = f"SL au-dessus BSL ({best_bsl.level_low:.1f})"
+                concepts_used.append("BSL")
+                tfs_used.add(best_bsl.tf)
+                strength_sum += best_bsl.strength
+                count += 1
+
+        if sl_price is None or count == 0:
             return None
 
-        # SL au-dessus de la résistance la plus proche du prix
-        resistance_levels.sort(reverse=True)
-        nearest_res = [r for r in resistance_levels if r > price]
-        if nearest_res:
-            sl_base = min(nearest_res)
-        else:
-            sl_base = max(resistance_levels)
-        sl_price = sl_base + self.pd_range * 0.15
-
-        # Raison SL
-        sl_buffer = self.pd_range * 0.15
-        sl_reason_parts = []
-        for d in resistance_details:
-            if str(sl_base) in d or f"{sl_base:.1f}" in d:
-                sl_reason_parts.append(d)
-        if sl_reason_parts:
-            sl_reason = f"SL au-dessus de {sl_reason_parts[0]} (résistance + buffer {sl_buffer:.1f}$)"
-        else:
-            sl_reason = f"SL à {sl_price:.1f}$ au-dessus de la résistance la plus proche ({sl_base:.1f}) + buffer {sl_buffer:.1f}$"
-
-        # TP vers le support le plus proche
-        use_fib = True
-        if sup_low > 0 and price - sup_low > self.pd_range * 0.3:
-            tp1 = sup_low
-            tp2 = price - self.pd_range * 1.272
-            tp3 = price - self.pd_range * 1.618
-            use_fib = False
-        else:
-            tp1 = price - self.pd_range * 1.272
-            tp2 = price - self.pd_range * 1.618
-            tp3 = None
-
-        # Raison TP
-        if use_fib:
-            fib_range = self.pd_range
-            tp_reason = f"Extension Fibonacci 1.272× PD range ({fib_range:.1f}$) → {tp1:.1f}$"
-        else:
-            tp_reason = f"Prochain support : {sup_detail}"
-
-        entry_low = price - self.pd_range * 0.05
-        entry_high = price + self.pd_range * 0.05
-
-        # Raison entrée avec TFs
+        # ── TP : prochain niveau SSL (sell-side liquidity) ──
+        tp1, tp2, tp3 = None, None, None
+        tp_reason = ""
         entry_parts = []
+
+        if key_levels:
+            # SSL = PDL, PWL, PML non sweepés en-dessous du prix
+            ssl_levels = [kl for kl in key_levels
+                         if kl.liquidity_type == "SSL" and not kl.swept and kl.level < price]
+            ssl_levels.sort(key=lambda k: price - k.level)
+
+            ssl_used = []
+            for ssl in ssl_levels[:3]:
+                ssl_used.append(f"{ssl.level_type} ({ssl.level:.1f})")
+                if tp1 is None:
+                    tp1 = ssl.level
+                elif tp2 is None:
+                    tp2 = ssl.level
+                elif tp3 is None:
+                    tp3 = ssl.level
+
+            if ssl_used:
+                tp_reason = " → ".join(ssl_used)
+
+        # Fallback : bullish OB/FVG en-dessous
+        if tp1 is None:
+            bullish_levels = []
+            for tf_name, result in analysis.items():
+                for ob in result.get("order_blocks", []):
+                    if ob.type == "bullish" and ob.high < price:
+                        bullish_levels.append((ob.high, f"OB {TIMEFRAME_LABELS.get(tf_name, tf_name)}"))
+                for fvg in result.get("fvgs", []):
+                    if fvg.type == "bullish" and fvg.upper < price:
+                        bullish_levels.append((fvg.upper, f"FVG {TIMEFRAME_LABELS.get(tf_name, tf_name)}"))
+
+            bullish_levels.sort(key=lambda x: price - x[0])
+            if bullish_levels:
+                tp1 = bullish_levels[0][0]
+                parts = [f"{bullish_levels[0][1]} ({tp1:.1f})"]
+                if len(bullish_levels) > 1:
+                    tp2 = bullish_levels[1][0]
+                    parts.append(f"{bullish_levels[1][1]} ({tp2:.1f})")
+                if len(bullish_levels) > 2:
+                    tp3 = bullish_levels[2][0]
+                    parts.append(f"{bullish_levels[2][1]} ({tp3:.1f})")
+                tp_reason = " → ".join(parts)
+
+        if tp1 is None:
+            return None  # Pas de TP identifiable → pas de setup
+
+        # ── Raison d'entrée ──
         if has_premium:
-            tfs = sorted(set(a.tf for a in alerts.get("Premium", []) if a.is_entry_zone))
-            entry_parts.append(f"zone Premium ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("Premium", []) if a.is_entry_zone))
+            entry_parts.append(f"zone Premium ({', '.join(tfs_label)})")
         if has_bearish_ob:
-            tfs = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bearish"))
-            entry_parts.append(f"OB baissier ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("OB", []) if a.is_entry_zone and a.direction == "bearish"))
+            entry_parts.append(f"OB baissier ({', '.join(tfs_label)})")
         if has_bearish_fvg:
-            tfs = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bearish"))
-            entry_parts.append(f"FVG baissier ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("FVG", []) if a.is_entry_zone and a.direction == "bearish"))
+            entry_parts.append(f"FVG baissier ({', '.join(tfs_label)})")
         if has_bsl_near:
-            tfs = sorted(set(a.tf for a in alerts.get("BSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
-            entry_parts.append(f"proximité BSL ({', '.join(tfs)})")
+            tfs_label = sorted(set(a.tf for a in alerts.get("BSL", []) if not a.is_entry_zone and abs(a.price_distance) < self.pd_range * 0.5))
+            entry_parts.append(f"proximité BSL ({', '.join(tfs_label)})")
+
         htf_str = "favorable" if bias_short > bias_long else "neutre"
         entry_reason = f"Prix dans {' + '.join(entry_parts)} — Bias HTF {htf_str}"
 
-        avg_strength = strength_sum / count if count > 0 else 0.0
+        # Force du setup
         has_htf_bias = bias_short > bias_long
-        strength = min(avg_strength * 0.5 + (0.3 if has_premium else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
-
-        reason_parts = entry_parts.copy()
+        avg_strength = strength_sum / count if count > 0 else 0.0
+        strength = min(avg_strength * 0.6 + (0.2 if has_premium else 0.0) + (0.2 if has_htf_bias else 0.0), 1.0)
 
         return ProximitySetup(
             direction="short",
@@ -910,7 +1020,7 @@ class PriceProximityAnalyzer:
             target_2=round(tp2, 1) if tp2 else None,
             target_3=round(tp3, 1) if tp3 else None,
             strength=round(strength, 2),
-            reason=f"Entrée SHORT possible — {" + ".join(reason_parts)} — Bias HTF {'favorable' if has_htf_bias else 'neutre'}",
+            reason=f"Entrée SHORT — {' + '.join(entry_parts)} → TP: {tp_reason}",
             entry_reason=entry_reason,
             sl_reason=sl_reason,
             tp_reason=tp_reason,
@@ -925,49 +1035,84 @@ class PriceProximityAnalyzer:
         alerts: Dict[str, List[ProximityAlert]],
         analysis: Dict[str, dict],
         current_price: float,
+        key_levels: Optional[List[KeyLevel]] = None,
     ) -> Optional[ProximitySetup]:
         """
         Construit un setup à partir d'un sweep de key level (Judas Swing/Turtle Soup).
-        Setup très puissant car le sweep indique une manipulation institutionnelle.
+        ICT : SL à 1 pip sous/au-dessus du niveau sweepé, TP vers prochaine liquidité.
         """
         direction = ss.direction  # "buy" ou "sell"
         level_price = ss.level.level
+        tp1, tp2, tp3 = None, None, None
+        tp_reason = ""
 
         if direction == "buy":
-            # Sweep SSL → LONG : entrée au-dessus du niveau, SL sous le low récent
-            entry_low = level_price + self.pd_range * 0.05
-            entry_high = level_price + self.pd_range * 0.15
-            sl_price = level_price - self.pd_range * 0.3
-            tp1 = current_price + self.pd_range * 1.272
-            tp2 = current_price + self.pd_range * 1.618
-            tp3 = current_price + self.pd_range * 2.0
+            # Sweep SSL → LONG
+            entry_low = level_price
+            entry_high = current_price
+            sl_price = level_price - 0.5
 
             entry_reason = f"Sweep SSL du {ss.level.level_type} ({ss.level.label}) à {level_price:.1f}$ — prix remonté → LONG"
-            sl_reason = f"SL sous le {ss.level.level_type} sweepé ({level_price:.1f}$) + buffer {self.pd_range * 0.3:.1f}$"
-            tp_reason = f"Extension Fibonacci 1.272× PD range vers le haut ({self.pd_range:.1f}$)"
-            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal LONG à haute probabilité"
+            sl_reason = f"SL sous {ss.level.level_type} sweepé ({level_price:.1f})"
+            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal LONG"
+
+            # TP = prochains BSL au-dessus
+            if key_levels:
+                bsl_levels = [kl for kl in key_levels
+                             if kl.liquidity_type == "BSL" and not kl.swept and kl.level > level_price]
+                bsl_levels.sort(key=lambda k: k.level - level_price)
+                for bsl in bsl_levels[:3]:
+                    if tp1 is None:
+                        tp1 = bsl.level
+                    elif tp2 is None:
+                        tp2 = bsl.level
+                    elif tp3 is None:
+                        tp3 = bsl.level
+                if tp1:
+                    parts = [f"{bsl_levels[0].level_type} ({bsl_levels[0].level:.1f})"]
+                    if tp2: parts.append(f"{bsl_levels[1].level_type} ({bsl_levels[1].level:.1f})")
+                    if tp3: parts.append(f"{bsl_levels[2].level_type} ({bsl_levels[2].level:.1f})")
+                    tp_reason = " → ".join(parts)
+
         else:
-            # Sweep BSL → SHORT : entrée sous le niveau, SL au-dessus du high récent
-            entry_low = level_price - self.pd_range * 0.15
-            entry_high = level_price - self.pd_range * 0.05
-            sl_price = level_price + self.pd_range * 0.3
-            tp1 = current_price - self.pd_range * 1.272
-            tp2 = current_price - self.pd_range * 1.618
-            tp3 = current_price - self.pd_range * 2.0
+            # Sweep BSL → SHORT
+            entry_low = current_price
+            entry_high = level_price
+            sl_price = level_price + 0.5
 
             entry_reason = f"Sweep BSL du {ss.level.level_type} ({ss.level.label}) à {level_price:.1f}$ — prix redescendu → SHORT"
-            sl_reason = f"SL au-dessus du {ss.level.level_type} sweepé ({level_price:.1f}$) + buffer {self.pd_range * 0.3:.1f}$"
-            tp_reason = f"Extension Fibonacci 1.272× PD range vers le bas ({self.pd_range:.1f}$)"
-            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal SHORT à haute probabilité"
+            sl_reason = f"SL au-dessus {ss.level.level_type} sweepé ({level_price:.1f})"
+            reason = f"🔥 SWEEP {ss.level.level_type} détecté — signal SHORT"
+
+            # TP = prochains SSL en-dessous
+            if key_levels:
+                ssl_levels = [kl for kl in key_levels
+                             if kl.liquidity_type == "SSL" and not kl.swept and kl.level < level_price]
+                ssl_levels.sort(key=lambda k: level_price - k.level)
+                for ssl in ssl_levels[:3]:
+                    if tp1 is None:
+                        tp1 = ssl.level
+                    elif tp2 is None:
+                        tp2 = ssl.level
+                    elif tp3 is None:
+                        tp3 = ssl.level
+                if tp1:
+                    parts = [f"{ssl_levels[0].level_type} ({ssl_levels[0].level:.1f})"]
+                    if tp2: parts.append(f"{ssl_levels[1].level_type} ({ssl_levels[1].level:.1f})")
+                    if tp3: parts.append(f"{ssl_levels[2].level_type} ({ssl_levels[2].level:.1f})")
+                    tp_reason = " → ".join(parts)
+
+        if tp1 is None:
+            return None  # Pas de TP identifiable → pas de setup
 
         return ProximitySetup(
             direction=direction,
             entry_low=round(entry_low, 1),
             entry_high=round(entry_high, 1),
             stop_loss=round(sl_price, 1),
-            target_1=round(tp1, 1),
-            target_2=round(tp2, 1),
-            target_3=round(tp3, 1),
+            target_1=round(tp1, 1) if tp1 else None,
+            target_2=round(tp2, 1) if tp2 else None,
+            target_3=round(tp3, 1) if tp3 else None,
             strength=min(ss.strength + 0.2, 1.0),
             reason=reason,
             entry_reason=entry_reason,
@@ -990,27 +1135,36 @@ class PriceProximityAnalyzer:
     ) -> Optional[ProximitySetup]:
         """
         Construit un setup basé sur la proximité avec un key level non sweepé.
-        Le prix a tendance à être attiré vers ces niveaux.
+        ICT : SL 1 pip sous/au-dessus du niveau, TP vers la liquidité suivante.
         """
         if direction == "long":
-            # Chercher un PDL/PWL/PML non sweepé au-dessus du prix
-            # → le prix va chercher cette SSL (target baissier puis rebond = LONG)
+            # SSL sous le prix (PDL/PWL/PML) = support attractif
             targets = [kl for kl in key_levels
                        if kl.liquidity_type == "SSL" and not kl.swept and kl.level < price]
             if not targets:
                 return None
 
-            # Prendre le plus proche
-            target = max(targets, key=lambda k: k.level)
+            target = max(targets, key=lambda k: k.level)  # Plus proche du prix
             if abs(price - target.level) > self.pd_range * 5:
                 return None
 
-            entry_low = price - self.pd_range * 0.05
-            entry_high = price + self.pd_range * 0.05
-            sl_price = target.level - self.pd_range * 0.2
-            tp1 = price + self.pd_range * 1.272
-            tp2 = price + self.pd_range * 1.618
-            tp3 = None
+            entry_low = price - 1.0
+            entry_high = price + 1.0
+            sl_price = target.level - 0.5  # 1 pip sous l'SSL
+
+            # TP : prochain BSL au-dessus
+            bsl_levels = [kl for kl in key_levels
+                         if kl.liquidity_type == "BSL" and not kl.swept and kl.level > price]
+            bsl_levels.sort(key=lambda k: k.level - price)
+            if bsl_levels:
+                tp1 = bsl_levels[0].level
+                tp2 = bsl_levels[1].level if len(bsl_levels) > 1 else None
+                tp3 = bsl_levels[2].level if len(bsl_levels) > 2 else None
+                tp_reason = f"{bsl_levels[0].level_type} ({bsl_levels[0].level:.1f})" + (
+                    f" → {bsl_levels[1].level_type} ({bsl_levels[1].level:.1f})" if tp2 else ""
+                )
+            else:
+                return None  # Pas de liquidité haussière identifiable
 
             return ProximitySetup(
                 direction="long",
@@ -1018,33 +1172,44 @@ class PriceProximityAnalyzer:
                 entry_high=round(entry_high, 1),
                 stop_loss=round(sl_price, 1),
                 target_1=round(tp1, 1),
-                target_2=round(tp2, 1),
-                target_3=tp3,
+                target_2=round(tp2, 1) if tp2 else None,
+                target_3=round(tp3, 1) if tp3 else None,
                 strength=0.65,
-                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — zone de SSL attractive",
-                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$)",
-                sl_reason=f"SL sous le {target.level_type} ({target.level:.1f}$) + buffer",
-                tp_reason=f"Extension Fibonacci 1.272× PD range ({self.pd_range:.1f}$)",
+                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — SSL attractive",
+                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$) — TP {tp_reason}",
+                sl_reason=f"SL sous {target.level_type} ({target.level:.1f})",
+                tp_reason=tp_reason,
                 concepts=[target.level_type],
                 tfs=[target.source_tf],
             )
         else:
-            # Chercher un PDH/PWH/PMH non sweepé au-dessus du prix
+            # BSL au-dessus du prix (PDH/PWH/PMH) = résistance attractive
             targets = [kl for kl in key_levels
                        if kl.liquidity_type == "BSL" and not kl.swept and kl.level > price]
             if not targets:
                 return None
 
-            target = min(targets, key=lambda k: k.level)
+            target = min(targets, key=lambda k: k.level)  # Plus proche du prix
             if abs(price - target.level) > self.pd_range * 5:
                 return None
 
-            entry_low = price - self.pd_range * 0.05
-            entry_high = price + self.pd_range * 0.05
-            sl_price = target.level + self.pd_range * 0.2
-            tp1 = price - self.pd_range * 1.272
-            tp2 = price - self.pd_range * 1.618
-            tp3 = None
+            entry_low = price - 1.0
+            entry_high = price + 1.0
+            sl_price = target.level + 0.5  # 1 pip au-dessus du BSL
+
+            # TP : prochain SSL en-dessous
+            ssl_levels = [kl for kl in key_levels
+                         if kl.liquidity_type == "SSL" and not kl.swept and kl.level < price]
+            ssl_levels.sort(key=lambda k: price - k.level)
+            if ssl_levels:
+                tp1 = ssl_levels[0].level
+                tp2 = ssl_levels[1].level if len(ssl_levels) > 1 else None
+                tp3 = ssl_levels[2].level if len(ssl_levels) > 2 else None
+                tp_reason = f"{ssl_levels[0].level_type} ({ssl_levels[0].level:.1f})" + (
+                    f" → {ssl_levels[1].level_type} ({ssl_levels[1].level:.1f})" if tp2 else ""
+                )
+            else:
+                return None
 
             return ProximitySetup(
                 direction="short",
@@ -1052,13 +1217,13 @@ class PriceProximityAnalyzer:
                 entry_high=round(entry_high, 1),
                 stop_loss=round(sl_price, 1),
                 target_1=round(tp1, 1),
-                target_2=round(tp2, 1),
-                target_3=tp3,
+                target_2=round(tp2, 1) if tp2 else None,
+                target_3=round(tp3, 1) if tp3 else None,
                 strength=0.65,
-                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — zone de BSL attractive",
-                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$)",
-                sl_reason=f"SL au-dessus du {target.level_type} ({target.level:.1f}$) + buffer",
-                tp_reason=f"Extension Fibonacci 1.272× PD range ({self.pd_range:.1f}$)",
+                reason=f"Proximité {target.level_type} ({target.label}) à {target.level:.1f}$ — BSL attractive",
+                entry_reason=f"Entrée proche du {target.level_type} ({target.level:.1f}$) — TP {tp_reason}",
+                sl_reason=f"SL au-dessus {target.level_type} ({target.level:.1f})",
+                tp_reason=tp_reason,
                 concepts=[target.level_type],
                 tfs=[target.source_tf],
             )

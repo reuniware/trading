@@ -172,17 +172,20 @@ class ICTAnalyzer:
                 proximity_setups, price_val, symbol=symbol, source="proximity", context=context,
             )
 
-            # Vérifier les setups existants avec les vrais High/Low OHLC (évite les résolutions sur ticks bid/ask)
+            # Vérifier les setups existants avec les vrais High/Low OHLC
+            # IMPORTANT : on utilise iloc[-2] (bougie PRÉCÉDENTE complétée) et non iloc[-1]
+            # (bougie en formation) pour éviter que les wicks intrabar ne déclenchent
+            # de faux SL sur des setups valides. On préfère aussi M5 à M1 car un
+            # bar M5 complété a une signification plus forte qu'un bar M1 minute.
             current_high = price_val
             current_low = price_val
-            # Utiliser la bougie M1/M5 la plus récente pour le high/low réel
-            for tf_check in ["M1", "M5", "M15"]:
-                if tf_check in data and data[tf_check] is not None and len(data[tf_check]) > 0:
-                    last_bar = data[tf_check].iloc[-1]
-                    current_high = float(last_bar["high"])
-                    current_low = float(last_bar["low"])
+            for tf_check in ["M5", "M15", "M30", "M1"]:
+                if tf_check in data and data[tf_check] is not None and len(data[tf_check]) > 1:
+                    prev_bar = data[tf_check].iloc[-2]  # Bougie précédente complétée
+                    current_high = float(prev_bar["high"])
+                    current_low = float(prev_bar["low"])
                     break
-            self.setup_tracker.check_all(price_val, current_high, current_low, min_age_seconds=60)
+            self.setup_tracker.check_all(price_val, current_high, current_low, min_age_seconds=180)
 
         # 8. Compte
         account_stats = self.account.get_account_stats()
